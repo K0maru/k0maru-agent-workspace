@@ -4,6 +4,7 @@ use k0maru_workspace::orchestrator::{WorkspaceManager, WorktreeOrchestrator};
 use k0maru_workspace::router::{
     AgentType, MultiplexerType, RouterDispatchOptions, TaskEnvelope, WorkspaceRouterAdapter,
 };
+use k0maru_workspace::verifier::{Verdict, VerifierConfig, WorkspaceVerifier};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -95,6 +96,39 @@ enum Commands {
         repo: PathBuf,
         #[arg(long, default_value_t = 86400)]
         max_age_secs: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Deterministically verify a sandbox and optionally merge or rollback
+    Verify {
+        /// Task identifier to verify
+        #[arg(long)]
+        task_id: String,
+        /// Target repository root
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Test command to execute in sandbox CWD
+        #[arg(long)]
+        test_cmd: Option<String>,
+        /// Build / compilation command to execute in sandbox CWD
+        #[arg(long)]
+        build_cmd: Option<String>,
+        /// Linter / static analysis command to execute in sandbox CWD
+        #[arg(long)]
+        linter_cmd: Option<String>,
+        /// Allowed modified files whitelist for scope guard
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        allowed_files: Vec<String>,
+        /// Automatically merge sandbox branch into target branch on pass
+        #[arg(long)]
+        auto_merge: bool,
+        /// Automatically rollback and delete sandbox on fail
+        #[arg(long)]
+        auto_rollback: bool,
+        /// Target branch to merge into (defaults to dev or main)
+        #[arg(long)]
+        target_branch: Option<String>,
+        /// Output machine-readable JSON execution receipt
         #[arg(long)]
         json: bool,
     },
@@ -377,6 +411,93 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(err) => {
                     eprintln!("Error pruning workspaces: {}", err);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Verify {
+            task_id,
+            repo,
+            test_cmd,
+            build_cmd,
+            linter_cmd,
+            allowed_files,
+            auto_merge,
+            auto_rollback,
+            target_branch,
+            json,
+        } => {
+            let orchestrator = WorktreeOrchestrator::new(&repo);
+            let config = VerifierConfig {
+                build_command: build_cmd,
+                test_command: test_cmd,
+                linter_command: linter_cmd,
+                allowed_files,
+                auto_merge_on_pass: auto_merge,
+                auto_rollback_on_fail: auto_rollback,
+                target_branch,
+                squash: true,
+            };
+
+            match WorkspaceVerifier::verify_sandbox(&repo, &task_id, &config, &orchestrator).await {
+                Ok((receipt, teardown_receipt)) => {
+                    let is_failed = receipt.verdict == Verdict::Failed;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&receipt)?);
+                    } else {
+                        println!("Verification receipt for task '{}':", receipt.task_id);
+                        println!("  Verdict:          {}", receipt.verdict);
+                        println!("  Workspace:        {}", receipt.workspace.display());
+                        if let Some(ref build) = receipt.checks.build {
+                            println!(
+                                "  Build Check:      {} ({}ms)",
+                                build.status, build.duration_ms
+                            );
+                        }
+                        if let Some(ref test) = receipt.checks.test {
+                            println!(
+                                "  Test Check:       {} ({}ms)",
+                                test.status, test.duration_ms
+                            );
+                        }
+                        if let Some(ref linter) = receipt.checks.linter {
+                            println!(
+                                "  Linter Check:     {} ({}ms)",
+                                linter.status, linter.duration_ms
+                            );
+                        }
+                        if let Some(ref scope) = receipt.checks.scope_guard {
+                            println!(
+                                "  Scope Guard:      {} ({} modified, {} unauthorized)",
+                                scope.status,
+                                scope.modified_files.len(),
+                                scope.unauthorized_files.len()
+                            );
+                        }
+                        if let Some(ref sha) = receipt.artifacts.git_patch_sha256 {
+                            println!("  Git Patch SHA256: {}", sha);
+                        }
+                        println!("  Diff Summary:     {}", receipt.artifacts.git_diff_summary);
+                        if let Some(ref err) = receipt.error_message {
+                            println!("  Error:            {}", err);
+                        }
+                        if let Some(ref td) = teardown_receipt {
+                            println!(
+                                "  Teardown:         action={}, branch_deleted={}",
+                                td.action_taken, td.branch_deleted
+                            );
+                            if let Some(ref commit) = td.merge_commit {
+                                println!("  Merge Commit:     {}", commit);
+                            }
+                        }
+                    }
+
+                    if is_failed {
+                        std::process::exit(1);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Error verifying workspace: {}", err);
                     std::process::exit(1);
                 }
             }

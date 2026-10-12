@@ -117,7 +117,58 @@ k0maru-workspace route \
   --json
 ```
 
-### 6. 巡检过期孤儿沙箱 (GC)
+### 6. 确定性测试门禁验证与自动合入 (Verify & Auto-Merge)
+
+在隔离沙箱内运行客观测试裁判（如 `cargo test`、`pytest`、`npm test`、`clippy`）。全套检查全绿时支持自动合入目标分支并回收沙箱：
+
+```bash
+# 执行测试验证，校验白名单文件修改，通过时自动 squash 合入 dev，失败时自动干净回滚
+k0maru-workspace verify \
+  --task-id task_01 \
+  --repo /path/to/repo \
+  --test-cmd "cargo test" \
+  --linter-cmd "cargo clippy -- -D warnings" \
+  --allowed-files "src/*,tests/*" \
+  --auto-merge \
+  --auto-rollback \
+  --target-branch dev \
+  --json
+```
+
+输出：
+```json
+{
+  "$schema": "https://k0maru.dev/schemas/agent-receipt-v1.json",
+  "task_id": "task_01",
+  "workspace": "/path/to/repo/.worktrees/task_01",
+  "verdict": "success",
+  "checks": {
+    "tests": {
+      "status": "passed",
+      "command": "cargo test",
+      "exit_code": 0,
+      "duration_ms": 1420
+    },
+    "linter": {
+      "status": "passed",
+      "command": "cargo clippy -- -D warnings",
+      "exit_code": 0,
+      "duration_ms": 860
+    },
+    "scope_guard": {
+      "status": "passed",
+      "modified_files": ["src/lib.rs", "tests/lib_test.rs"],
+      "unauthorized_files": []
+    }
+  },
+  "artifacts": {
+    "git_patch_sha256": "4a7d189f76c5b0...",
+    "receipt_timestamp": "2026-10-12T14:40:00Z"
+  }
+}
+```
+
+### 7. 巡检过期孤儿沙箱 (GC)
 
 ```bash
 # 清理超过 24 小时未释放的沙箱（默认 86400 秒）
@@ -136,11 +187,13 @@ use k0maru_workspace::orchestrator::{WorkspaceManager, WorktreeOrchestrator};
 use k0maru_workspace::router::{
     AgentType, MultiplexerType, RouterDispatchOptions, TaskEnvelope, WorkspaceRouterAdapter,
 };
+use k0maru_workspace::verifier::{VerifierConfig, WorkspaceVerifier};
 use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let repo_root = PathBuf::from("/path/to/repo");
+    let orchestrator = WorktreeOrchestrator::new();
 
     // 1. 直接路由并消费来自 k0maru-agent-router 的任务工单
     let envelope: TaskEnvelope = serde_json::from_str(r#"{ ... }"#)?;
@@ -149,9 +202,26 @@ async fn main() -> anyhow::Result<()> {
         agent: AgentType::Agy,
         ..Default::default()
     };
-    let receipt = WorkspaceRouterAdapter::dispatch(&envelope, opts).await?;
-    println!("沙箱已就绪: {:?}", receipt.sandbox_handle.workspace_path);
-    println!("窗格启动指令: {:?}", receipt.multiplexer_command);
+    let dispatch_receipt = WorkspaceRouterAdapter::dispatch(&envelope, opts).await?;
+    println!("沙箱已就绪: {:?}", dispatch_receipt.sandbox_handle.workspace_path);
+
+    // 2. 执行确定性门禁自检与自动合并
+    let config = VerifierConfig::builder()
+        .test_command("cargo test")
+        .linter_command("cargo clippy -- -D warnings")
+        .auto_merge_on_pass(true)
+        .target_branch("dev")
+        .build();
+
+    let (receipt, teardown) = WorkspaceVerifier::verify_sandbox(
+        &repo_root,
+        &envelope.task_id,
+        &config,
+        &orchestrator,
+    ).await?;
+
+    println!("验证判定结果: {:?}", receipt.verdict);
+    println!("Diff SHA-256 签名: {:?}", receipt.artifacts.git_patch_sha256);
 
     Ok(())
 }
@@ -168,15 +238,18 @@ async fn main() -> anyhow::Result<()> {
   - Cargo `target/`、Node `node_modules`、Python `.venv` 智能软链复用。
   - 任务专有 `.env` 与 MCP 配置注入，主仓环境只读防污染。
   - 安全解绑（cleanup mounts），严防 Worktree 销毁时误删主仓缓存。
-- [x] **Phase 3: Router 与终端多路复用器联动**（当前阶段）
+- [x] **Phase 3: Router 与终端多路复用器联动**
   - 深度联动 `k0maru-agent-router`，支持原生 `agent-task-v1` `TaskEnvelope` 工单路由。
   - Herdr & Tmux 窗格自动切分与 Agent 唤醒指令生成。
   - 闭环验证跨仓 Bug 隔离热修复。
-- [ ] **Phase 4: 确定性验证器与自动合入**
-  - 结合 `k0maru-agent-verifier` 实现测试通过后自动合入。
+- [x] **Phase 4: 确定性验证器与自动合入门禁**
+  - 契约严格对齐 `agent-receipt-v1.json` 不可变凭证。
+  - 范围防腐门禁（Scope Guard），根据白名单物理拦截越权文件篡改。
+  - Git Diff SHA-256 指纹验签与测试 Exit Code 驱动的原子合并/自动回滚。
 
 ---
 
 ## 🛡️ 开源协议
 
 Apache-2.0 / MIT
+
