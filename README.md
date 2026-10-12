@@ -106,7 +106,18 @@ k0maru-workspace teardown --task-id task_01 --repo /path/to/repo --action abort
 k0maru-workspace teardown --task-id task_01 --repo /path/to/repo --action merge --target-branch dev --squash
 ```
 
-### 5. Prune Stale Sandboxes (GC)
+### 5. Route TaskEnvelope from Router & Bind Multiplexer
+
+```bash
+# Ingest task envelope, provision sandbox, and generate Tmux/Herdr split command
+k0maru-workspace route \
+  --envelope envelope.json \
+  --multiplexer herdr \
+  --agent agy \
+  --json
+```
+
+### 6. Prune Stale Sandboxes (GC)
 
 ```bash
 # Prune sandboxes older than 24 hours (default 86400s)
@@ -122,32 +133,25 @@ k0maru-workspace prune --repo /path/to/repo --max-age-secs 86400
 ```rust
 use k0maru_workspace::handle::{CacheType, TeardownAction, WorkspaceProvisionRequest};
 use k0maru_workspace::orchestrator::{WorkspaceManager, WorktreeOrchestrator};
+use k0maru_workspace::router::{
+    AgentType, MultiplexerType, RouterDispatchOptions, TaskEnvelope, WorkspaceRouterAdapter,
+};
 use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let repo_root = PathBuf::from("/path/to/repo");
-    let orchestrator = WorktreeOrchestrator::new(&repo_root);
 
-    // 1. Provision sandbox with shared caches & configs
-    let req = WorkspaceProvisionRequest::new("task-42", &repo_root)
-        .with_base_branch("dev")
-        .with_caches(vec![CacheType::CargoTarget, CacheType::NodeModules])
-        .with_injected_configs(vec![".env".into()]);
-    let handle = orchestrator.provision(&req).await?;
-    println!("Sandbox ready at: {:?}", handle.workspace_path);
-
-    // 2. Teardown (Merge into dev)
-    let receipt = orchestrator
-        .teardown(
-            "task-42",
-            TeardownAction::Merge {
-                target_branch: "dev".into(),
-                squash: true,
-            },
-        )
-        .await?;
-    println!("Teardown action: {}", receipt.action_taken);
+    // 1. Route task envelope directly from k0maru-agent-router
+    let envelope: TaskEnvelope = serde_json::from_str(r#"{ ... }"#)?;
+    let opts = RouterDispatchOptions {
+        multiplexer: MultiplexerType::Tmux,
+        agent: AgentType::Agy,
+        ..Default::default()
+    };
+    let receipt = WorkspaceRouterAdapter::dispatch(&envelope, opts).await?;
+    println!("Sandbox provisioned at: {:?}", receipt.sandbox_handle.workspace_path);
+    println!("Multiplexer command: {:?}", receipt.multiplexer_command);
 
     Ok(())
 }
@@ -160,12 +164,14 @@ async fn main() -> anyhow::Result<()> {
 - [x] **Phase 1: Worktree Core & Atomic Lifecycle**
   - Worktree provision, rollback, list, teardown (merge/abort/retain), and prune GC.
   - CLI commands and 100% passing regression test suite.
-- [x] **Phase 2: Cache & Toolchain Sharing** (Current)
+- [x] **Phase 2: Cache & Toolchain Sharing**
   - Shared symlinks for Cargo `target/`, Node `node_modules`, and Python venvs.
   - Safe unlinking on teardown to prevent parent repository cache corruption.
   - Custom environment (`.env`) and MCP server config injection.
-- [ ] **Phase 3: Router & Multiplexer Integration**
-  - Direct integration with `k0maru-agent-router` and Herdr/Tmux multiplexers.
+- [x] **Phase 3: Router & Multiplexer Integration** (Current)
+  - Direct integration with `k0maru-agent-router` via `agent-task-v1` `TaskEnvelope`.
+  - Herdr & Tmux pane splitting and prompt injection command generation.
+  - Automated cross-repo hotfix isolation.
 - [ ] **Phase 4: Autonomous Verifier & Auto-Merge**
   - Automated test execution before merge gate.
 

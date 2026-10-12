@@ -106,7 +106,18 @@ k0maru-workspace teardown --task-id task_01 --repo /path/to/repo --action abort
 k0maru-workspace teardown --task-id task_01 --repo /path/to/repo --action merge --target-branch dev --squash
 ```
 
-### 5. 巡检过期孤儿沙箱 (GC)
+### 5. 联动 Router 工单与多路复用器分屏
+
+```bash
+# 接收 Router 下发的 TaskEnvelope，自动配发 Worktree 并生成分屏指令
+k0maru-workspace route \
+  --envelope envelope.json \
+  --multiplexer herdr \
+  --agent agy \
+  --json
+```
+
+### 6. 巡检过期孤儿沙箱 (GC)
 
 ```bash
 # 清理超过 24 小时未释放的沙箱（默认 86400 秒）
@@ -122,32 +133,25 @@ k0maru-workspace prune --repo /path/to/repo --max-age-secs 86400
 ```rust
 use k0maru_workspace::handle::{CacheType, TeardownAction, WorkspaceProvisionRequest};
 use k0maru_workspace::orchestrator::{WorkspaceManager, WorktreeOrchestrator};
+use k0maru_workspace::router::{
+    AgentType, MultiplexerType, RouterDispatchOptions, TaskEnvelope, WorkspaceRouterAdapter,
+};
 use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let repo_root = PathBuf::from("/path/to/repo");
-    let orchestrator = WorktreeOrchestrator::new(&repo_root);
 
-    // 1. 配发沙箱（挂载 Cargo/Node 缓存并注入 .env 配置）
-    let req = WorkspaceProvisionRequest::new("task-42", &repo_root)
-        .with_base_branch("dev")
-        .with_caches(vec![CacheType::CargoTarget, CacheType::NodeModules])
-        .with_injected_configs(vec![".env".into()]);
-    let handle = orchestrator.provision(&req).await?;
-    println!("沙箱已就绪: {:?}", handle.workspace_path);
-
-    // 2. 任务完成后合并入 dev 分支
-    let receipt = orchestrator
-        .teardown(
-            "task-42",
-            TeardownAction::Merge {
-                target_branch: "dev".into(),
-                squash: true,
-            },
-        )
-        .await?;
-    println!("清理状态: {}", receipt.action_taken);
+    // 1. 直接路由并消费来自 k0maru-agent-router 的任务工单
+    let envelope: TaskEnvelope = serde_json::from_str(r#"{ ... }"#)?;
+    let opts = RouterDispatchOptions {
+        multiplexer: MultiplexerType::Herdr,
+        agent: AgentType::Agy,
+        ..Default::default()
+    };
+    let receipt = WorkspaceRouterAdapter::dispatch(&envelope, opts).await?;
+    println!("沙箱已就绪: {:?}", receipt.sandbox_handle.workspace_path);
+    println!("窗格启动指令: {:?}", receipt.multiplexer_command);
 
     Ok(())
 }
@@ -160,12 +164,14 @@ async fn main() -> anyhow::Result<()> {
 - [x] **Phase 1: Worktree 核心与原子生命周期**
   - 原生 Worktree 配发、回滚、查询、Teardown（merge/abort/retain）及 Prune GC。
   - CLI 工具落地与 100% 通过的自动化回归测试。
-- [x] **Phase 2: 缓存与工具链智能共享**（当前阶段）
+- [x] **Phase 2: 缓存与工具链智能共享**
   - Cargo `target/`、Node `node_modules`、Python `.venv` 智能软链复用。
   - 任务专有 `.env` 与 MCP 配置注入，主仓环境只读防污染。
   - 安全解绑（cleanup mounts），严防 Worktree 销毁时误删主仓缓存。
-- [ ] **Phase 3: Router 与终端多路复用器联动**
-  - 联动 `k0maru-agent-router`，支持 Herdr/Tmux 自动分屏与路径绑定。
+- [x] **Phase 3: Router 与终端多路复用器联动**（当前阶段）
+  - 深度联动 `k0maru-agent-router`，支持原生 `agent-task-v1` `TaskEnvelope` 工单路由。
+  - Herdr & Tmux 窗格自动切分与 Agent 唤醒指令生成。
+  - 闭环验证跨仓 Bug 隔离热修复。
 - [ ] **Phase 4: 确定性验证器与自动合入**
   - 结合 `k0maru-agent-verifier` 实现测试通过后自动合入。
 
