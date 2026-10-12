@@ -25,6 +25,9 @@ pub enum WorkspaceError {
 
     #[error("Branch error: {0}")]
     BranchError(String),
+
+    #[error("Verification receipt required for merge: {reason}")]
+    VerificationReceiptRequired { reason: String },
 }
 
 #[cfg(test)]
@@ -49,6 +52,14 @@ mod tests {
             task_id: "missing".into(),
         };
         assert_eq!(err3.to_string(), "Workspace not found for task 'missing'");
+
+        let err4 = WorkspaceError::VerificationReceiptRequired {
+            reason: "receipt missing".into(),
+        };
+        assert_eq!(
+            err4.to_string(),
+            "Verification receipt required for merge: receipt missing"
+        );
     }
 
     #[test]

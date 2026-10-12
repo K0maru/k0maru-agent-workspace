@@ -89,6 +89,8 @@ enum Commands {
         #[arg(long)]
         squash: bool,
         #[arg(long)]
+        force: bool,
+        #[arg(long)]
         json: bool,
     },
     /// List active sandboxes and stale worktrees
@@ -320,6 +322,7 @@ async fn main() -> anyhow::Result<()> {
             action,
             target_branch,
             squash,
+            force,
             json,
         } => {
             let orchestrator = WorktreeOrchestrator::new(&repo);
@@ -330,6 +333,7 @@ async fn main() -> anyhow::Result<()> {
                     TeardownAction::Merge {
                         target_branch: target,
                         squash,
+                        force,
                     }
                 }
                 ActionArg::Retain => TeardownAction::Retain,
@@ -355,7 +359,13 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(err) => {
                     eprintln!("Error tearing down workspace: {}", err);
-                    std::process::exit(1);
+                    let exit_code = match err {
+                        k0maru_workspace::error::WorkspaceError::VerificationReceiptRequired {
+                            ..
+                        } => k0maru_workspace::receipt::EXIT_CODE_VERIFICATION_FAILED,
+                        _ => 1,
+                    };
+                    std::process::exit(exit_code);
                 }
             }
         }

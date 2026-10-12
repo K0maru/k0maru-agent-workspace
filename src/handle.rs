@@ -87,6 +87,8 @@ pub enum TeardownAction {
         target_branch: String,
         #[serde(default)]
         squash: bool,
+        #[serde(default)]
+        force: bool,
     },
     Retain,
 }
@@ -156,10 +158,16 @@ mod tests {
         let merge = TeardownAction::Merge {
             target_branch: "dev".into(),
             squash: true,
+            force: false,
         };
         let json_merge = serde_json::to_string(&merge).unwrap();
         let back_merge: TeardownAction = serde_json::from_str(&json_merge).unwrap();
         assert_eq!(merge, back_merge);
+
+        // Test backward compatibility when force field is omitted
+        let legacy_merge_json = r#"{"type":"merge","target_branch":"dev","squash":true}"#;
+        let legacy_merge: TeardownAction = serde_json::from_str(legacy_merge_json).unwrap();
+        assert_eq!(legacy_merge, merge);
     }
 
     #[test]

@@ -182,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
             TeardownAction::Merge {
                 target_branch: "dev".to_string(),
                 squash: true,
+                force: false,
             },
         )
         .await?;

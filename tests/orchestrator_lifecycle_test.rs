@@ -73,6 +73,7 @@ async fn test_full_lifecycle_merge_to_dev() {
             TeardownAction::Merge {
                 target_branch: "dev".to_string(),
                 squash: true,
+                force: true,
             },
         )
         .await
