@@ -14,3 +14,10 @@
 - [x] 2. 实现原子清理与合并：支持 Fast-Forward merge、worktree remove、branch -D 回滚；
 - [x] 3. 实现 CLI 子命令：`provision`, `teardown`, `list`, `prune`；
 - [x] 4. 编写 100% 覆盖率的自动化回归测试与沙箱生命周期测试。
+
+## 🧭 研发任务清单 (Phase 2 - Cache & Toolchain Linker)
+- [x] 1. 实现 `EnvironmentManager`：支持 Cargo `target/`、Node `node_modules`、Python `.venv` 智能符号链接挂载；
+- [x] 2. 实现敏感环境变量与配置注入：支持自动隔离复制 `.env`, `.env.local`, `.mcp.json`，确保沙箱内修改不污染主仓；
+- [x] 3. 增强原子清理契约：在沙箱删除与回滚前显式安全解除挂载（`cleanup_mounts`），严防误删主仓共享缓存目录；
+- [x] 4. CLI 拓展：`provision` 支持 `--cache <cargo|node|python>` 与 `--inject <file>` 参数；
+- [x] 5. 编写 Phase 2 缓存挂载、配置注入与安全回滚的完整集成测试套件。

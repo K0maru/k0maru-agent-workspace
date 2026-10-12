@@ -67,10 +67,16 @@ cargo build --release
 # Binary will be available at ./target/release/k0maru-workspace
 ```
 
-### 2. Provision an Isolated Sandbox
+### 2. Provision an Isolated Sandbox (with Caches & Configs)
 
 ```bash
-k0maru-workspace provision --task-id task_01 --repo /path/to/repo --base dev
+k0maru-workspace provision \
+  --task-id task_01 \
+  --repo /path/to/repo \
+  --base dev \
+  --cache cargo \
+  --cache node \
+  --inject .env
 ```
 Output:
 ```text
@@ -78,6 +84,8 @@ Provisioned sandbox for task 'task_01':
   Workspace Path: /path/to/repo/.worktrees/task_01
   Branch:         feat/task-01
   Base Branch:    dev
+  Mounted Caches: [CargoTarget, NodeModules]
+  Injected Files: [".env"]
 ```
 
 ### 3. List Active Sandboxes
@@ -112,7 +120,7 @@ k0maru-workspace prune --repo /path/to/repo --max-age-secs 86400
 ## 📦 Rust API Example
 
 ```rust
-use k0maru_workspace::handle::{TeardownAction, WorkspaceProvisionRequest};
+use k0maru_workspace::handle::{CacheType, TeardownAction, WorkspaceProvisionRequest};
 use k0maru_workspace::orchestrator::{WorkspaceManager, WorktreeOrchestrator};
 use std::path::PathBuf;
 
@@ -121,9 +129,11 @@ async fn main() -> anyhow::Result<()> {
     let repo_root = PathBuf::from("/path/to/repo");
     let orchestrator = WorktreeOrchestrator::new(&repo_root);
 
-    // 1. Provision sandbox
+    // 1. Provision sandbox with shared caches & configs
     let req = WorkspaceProvisionRequest::new("task-42", &repo_root)
-        .with_base_branch("dev");
+        .with_base_branch("dev")
+        .with_caches(vec![CacheType::CargoTarget, CacheType::NodeModules])
+        .with_injected_configs(vec![".env".into()]);
     let handle = orchestrator.provision(&req).await?;
     println!("Sandbox ready at: {:?}", handle.workspace_path);
 
@@ -147,11 +157,12 @@ async fn main() -> anyhow::Result<()> {
 
 ## 🧭 Project Roadmap
 
-- [x] **Phase 1: Worktree Core & Atomic Lifecycle** (Current)
+- [x] **Phase 1: Worktree Core & Atomic Lifecycle**
   - Worktree provision, rollback, list, teardown (merge/abort/retain), and prune GC.
   - CLI commands and 100% passing regression test suite.
-- [ ] **Phase 2: Cache & Toolchain Sharing**
+- [x] **Phase 2: Cache & Toolchain Sharing** (Current)
   - Shared symlinks for Cargo `target/`, Node `node_modules`, and Python venvs.
+  - Safe unlinking on teardown to prevent parent repository cache corruption.
   - Custom environment (`.env`) and MCP server config injection.
 - [ ] **Phase 3: Router & Multiplexer Integration**
   - Direct integration with `k0maru-agent-router` and Herdr/Tmux multiplexers.

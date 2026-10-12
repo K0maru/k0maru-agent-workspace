@@ -1,3 +1,4 @@
+use crate::env::EnvironmentManager;
 use crate::error::WorkspaceError;
 use crate::handle::{
     PruneReport, SandboxHandle, TeardownAction, TeardownReceipt, WorkspaceProvisionRequest,
@@ -148,6 +149,7 @@ impl WorkspaceManager for WorktreeOrchestrator {
 
         if let Err(e) = add_res {
             // Atomic rollback
+            let _ = EnvironmentManager::cleanup_mounts(&target_path);
             let _ = self
                 .run_git(&["worktree", "remove", "--force", &path_str])
                 .await;
@@ -158,6 +160,35 @@ impl WorkspaceManager for WorktreeOrchestrator {
             return Err(e);
         }
 
+        let mounted_caches = match EnvironmentManager::mount_caches(
+            &self.repo_root,
+            &target_path,
+            &req.shared_caches,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = EnvironmentManager::cleanup_mounts(&target_path);
+                let _ = self
+                    .run_git(&["worktree", "remove", "--force", &path_str])
+                    .await;
+                let _ = self.run_git(&["branch", "-D", &branch_name]).await;
+                if target_path.exists() {
+                    let _ = fs::remove_dir_all(&target_path).await;
+                }
+                return Err(e);
+            }
+        };
+
+        let injected_files = EnvironmentManager::inject_configs(
+            &self.repo_root,
+            &target_path,
+            &req.injected_configs,
+        )
+        .await
+        .unwrap_or_default();
+
         Ok(SandboxHandle {
             task_id: req.task_id.clone(),
             workspace_path: target_path,
@@ -165,6 +196,8 @@ impl WorkspaceManager for WorktreeOrchestrator {
             base_branch: req.base_branch.clone(),
             is_isolated: true,
             created_at: chrono::Utc::now().to_rfc3339(),
+            mounted_caches,
+            injected_files,
         })
     }
 
@@ -249,6 +282,8 @@ impl WorkspaceManager for WorktreeOrchestrator {
 
         match action {
             TeardownAction::Abort => {
+                let unmounted_caches =
+                    EnvironmentManager::cleanup_mounts(&target_path).unwrap_or_default();
                 if target_path.exists() {
                     let _ = self
                         .run_git(&["worktree", "remove", "--force", &path_str])
@@ -270,6 +305,7 @@ impl WorkspaceManager for WorktreeOrchestrator {
                     branch_deleted,
                     merge_commit: None,
                     duration_ms: start_time.elapsed().as_millis() as u64,
+                    unmounted_caches,
                 })
             }
             TeardownAction::Merge {
@@ -312,7 +348,9 @@ impl WorkspaceManager for WorktreeOrchestrator {
 
                 let merge_commit = self.run_git(&["rev-parse", "HEAD"]).await.ok();
 
-                // Clean up worktree and ephemeral branch
+                // Clean up mounts, worktree, and ephemeral branch
+                let unmounted_caches =
+                    EnvironmentManager::cleanup_mounts(&target_path).unwrap_or_default();
                 if target_path.exists() {
                     let _ = self
                         .run_git(&["worktree", "remove", "--force", &path_str])
@@ -330,6 +368,7 @@ impl WorkspaceManager for WorktreeOrchestrator {
                     branch_deleted,
                     merge_commit,
                     duration_ms: start_time.elapsed().as_millis() as u64,
+                    unmounted_caches,
                 })
             }
             TeardownAction::Retain => Ok(TeardownReceipt {
@@ -339,6 +378,7 @@ impl WorkspaceManager for WorktreeOrchestrator {
                 branch_deleted: false,
                 merge_commit: None,
                 duration_ms: start_time.elapsed().as_millis() as u64,
+                unmounted_caches: Vec::new(),
             }),
         }
     }

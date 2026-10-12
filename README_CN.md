@@ -67,10 +67,16 @@ cargo build --release
 # 生成的可执行文件位于 ./target/release/k0maru-workspace
 ```
 
-### 2. 创建隔离沙箱
+### 2. 创建隔离沙箱（支持缓存挂载与配置注入）
 
 ```bash
-k0maru-workspace provision --task-id task_01 --repo /path/to/repo --base dev
+k0maru-workspace provision \
+  --task-id task_01 \
+  --repo /path/to/repo \
+  --base dev \
+  --cache cargo \
+  --cache node \
+  --inject .env
 ```
 输出示例：
 ```text
@@ -78,6 +84,8 @@ Provisioned sandbox for task 'task_01':
   Workspace Path: /path/to/repo/.worktrees/task_01
   Branch:         feat/task-01
   Base Branch:    dev
+  Mounted Caches: [CargoTarget, NodeModules]
+  Injected Files: [".env"]
 ```
 
 ### 3. 查看活跃沙箱列表
@@ -112,7 +120,7 @@ k0maru-workspace prune --repo /path/to/repo --max-age-secs 86400
 ## 📦 Rust API 使用示例
 
 ```rust
-use k0maru_workspace::handle::{TeardownAction, WorkspaceProvisionRequest};
+use k0maru_workspace::handle::{CacheType, TeardownAction, WorkspaceProvisionRequest};
 use k0maru_workspace::orchestrator::{WorkspaceManager, WorktreeOrchestrator};
 use std::path::PathBuf;
 
@@ -121,9 +129,11 @@ async fn main() -> anyhow::Result<()> {
     let repo_root = PathBuf::from("/path/to/repo");
     let orchestrator = WorktreeOrchestrator::new(&repo_root);
 
-    // 1. 配发沙箱
+    // 1. 配发沙箱（挂载 Cargo/Node 缓存并注入 .env 配置）
     let req = WorkspaceProvisionRequest::new("task-42", &repo_root)
-        .with_base_branch("dev");
+        .with_base_branch("dev")
+        .with_caches(vec![CacheType::CargoTarget, CacheType::NodeModules])
+        .with_injected_configs(vec![".env".into()]);
     let handle = orchestrator.provision(&req).await?;
     println!("沙箱已就绪: {:?}", handle.workspace_path);
 
@@ -147,12 +157,13 @@ async fn main() -> anyhow::Result<()> {
 
 ## 🧭 路线图规划
 
-- [x] **Phase 1: Worktree 核心与原子生命周期**（当前阶段）
+- [x] **Phase 1: Worktree 核心与原子生命周期**
   - 原生 Worktree 配发、回滚、查询、Teardown（merge/abort/retain）及 Prune GC。
   - CLI 工具落地与 100% 通过的自动化回归测试。
-- [ ] **Phase 2: 缓存与工具链智能共享**
-  - Cargo `target/`、Node `node_modules`、Python venv 智能软链复用。
-  - 任务专有 `.env` 与 MCP 配置注入。
+- [x] **Phase 2: 缓存与工具链智能共享**（当前阶段）
+  - Cargo `target/`、Node `node_modules`、Python `.venv` 智能软链复用。
+  - 任务专有 `.env` 与 MCP 配置注入，主仓环境只读防污染。
+  - 安全解绑（cleanup mounts），严防 Worktree 销毁时误删主仓缓存。
 - [ ] **Phase 3: Router 与终端多路复用器联动**
   - 联动 `k0maru-agent-router`，支持 Herdr/Tmux 自动分屏与路径绑定。
 - [ ] **Phase 4: 确定性验证器与自动合入**
