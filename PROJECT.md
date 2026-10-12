@@ -10,7 +10,7 @@
 4. **Router 协议联动**：接收 TaskEnvelope 自动配发 Worktree，并将隔离绝对路径传回 Herdr/Tmux 窗格。
 
 ## 🧭 研发任务清单 (Phase 1)
-- [ ] 1. 实现 `WorktreeOrchestrator`：执行底层 `git worktree` 原语，支持任务隔离创建与幂等检查；
-- [ ] 2. 实现原子清理与合并：支持 Fast-Forward merge、worktree remove、branch -D 回滚；
-- [ ] 3. 实现 CLI 子命令：`provision`, `teardown`, `list`, `prune`；
-- [ ] 4. 编写 100% 覆盖率的自动化回归测试与沙箱生命周期测试。
+- [x] 1. 实现 `WorktreeOrchestrator`：执行底层 `git worktree` 原语，支持任务隔离创建与幂等检查；
+- [x] 2. 实现原子清理与合并：支持 Fast-Forward merge、worktree remove、branch -D 回滚；
+- [x] 3. 实现 CLI 子命令：`provision`, `teardown`, `list`, `prune`；
+- [x] 4. 编写 100% 覆盖率的自动化回归测试与沙箱生命周期测试。
