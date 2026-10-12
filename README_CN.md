@@ -97,11 +97,15 @@ k0maru-workspace list --repo /path/to/repo
 ### 4. 回收与清理沙箱
 
 **放弃改动并强力清理：**
+### 4. 销毁或合并沙箱 (Teardown)
+
+**放弃修改并原子清理：**
 ```bash
 k0maru-workspace teardown --task-id task_01 --repo /path/to/repo --action abort
 ```
 
-**测试通过并合并至主干：**
+**测试通过并合并至目标分支：**
+*(注：合入前的物理退出码测试与门禁校验由 `k0maru-verifier` 独立裁决)*
 ```bash
 k0maru-workspace teardown --task-id task_01 --repo /path/to/repo --action merge --target-branch dev --squash
 ```
@@ -117,58 +121,7 @@ k0maru-workspace route \
   --json
 ```
 
-### 6. 确定性测试门禁验证与自动合入 (Verify & Auto-Merge)
-
-在隔离沙箱内运行客观测试裁判（如 `cargo test`、`pytest`、`npm test`、`clippy`）。全套检查全绿时支持自动合入目标分支并回收沙箱：
-
-```bash
-# 执行测试验证，校验白名单文件修改，通过时自动 squash 合入 dev，失败时自动干净回滚
-k0maru-workspace verify \
-  --task-id task_01 \
-  --repo /path/to/repo \
-  --test-cmd "cargo test" \
-  --linter-cmd "cargo clippy -- -D warnings" \
-  --allowed-files "src/*,tests/*" \
-  --auto-merge \
-  --auto-rollback \
-  --target-branch dev \
-  --json
-```
-
-输出：
-```json
-{
-  "$schema": "https://k0maru.dev/schemas/agent-receipt-v1.json",
-  "task_id": "task_01",
-  "workspace": "/path/to/repo/.worktrees/task_01",
-  "verdict": "success",
-  "checks": {
-    "tests": {
-      "status": "passed",
-      "command": "cargo test",
-      "exit_code": 0,
-      "duration_ms": 1420
-    },
-    "linter": {
-      "status": "passed",
-      "command": "cargo clippy -- -D warnings",
-      "exit_code": 0,
-      "duration_ms": 860
-    },
-    "scope_guard": {
-      "status": "passed",
-      "modified_files": ["src/lib.rs", "tests/lib_test.rs"],
-      "unauthorized_files": []
-    }
-  },
-  "artifacts": {
-    "git_patch_sha256": "4a7d189f76c5b0...",
-    "receipt_timestamp": "2026-10-12T14:40:00Z"
-  }
-}
-```
-
-### 7. 巡检过期孤儿沙箱 (GC)
+### 6. 巡检过期孤儿沙箱 (GC)
 
 ```bash
 # 清理超过 24 小时未释放的沙箱（默认 86400 秒）
@@ -179,49 +132,61 @@ k0maru-workspace prune --repo /path/to/repo --max-age-secs 86400
 
 ---
 
+## ⚖️ 质量门禁与测试裁判解耦规约
+
+遵循 Unix 哲学与 **K0maru-Harness** 矩阵正交解耦规范：
+- `k0maru-agent-workspace` 严格聚焦于**工作区与沙箱的瞬态生命周期管理**（`provision`、`teardown`、`list`、`prune`、`route`）。
+- 客观进程退出码裁判、范围防腐（Scope Guard）与 `agent-receipt-v1.json` 不可变凭证签发，由第四块独立核心积木 [`k0maru-agent-verifier`](https://github.com/K0maru/k0maru-agent-verifier) 负责。
+- 标准协同流转时序：
+  ```mermaid
+  flowchart LR
+      Router["k0maru-router"] --> Provision["workspace provision / route"]
+      Provision --> Agent["Agent 沙箱编码修改"]
+      Agent --> Verifier["k0maru-verifier (Exit Code 物理硬门禁)"]
+      Verifier --> Merge["workspace teardown --action merge"]
+  ```
+
+---
+
 ## 📦 Rust API 使用示例
 
 ```rust
-use k0maru_workspace::handle::{CacheType, TeardownAction, WorkspaceProvisionRequest};
+use k0maru_workspace::handle::{CacheType, IsolationStrategy, TeardownAction, WorkspaceProvisionRequest};
 use k0maru_workspace::orchestrator::{WorkspaceManager, WorktreeOrchestrator};
 use k0maru_workspace::router::{
     AgentType, MultiplexerType, RouterDispatchOptions, TaskEnvelope, WorkspaceRouterAdapter,
 };
-use k0maru_workspace::verifier::{VerifierConfig, WorkspaceVerifier};
 use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let repo_root = PathBuf::from("/path/to/repo");
-    let orchestrator = WorktreeOrchestrator::new();
+    let orchestrator = WorktreeOrchestrator::new(&repo_root);
 
-    // 1. 直接路由并消费来自 k0maru-agent-router 的任务工单
-    let envelope: TaskEnvelope = serde_json::from_str(r#"{ ... }"#)?;
-    let opts = RouterDispatchOptions {
-        multiplexer: MultiplexerType::Herdr,
-        agent: AgentType::Agy,
-        ..Default::default()
-    };
-    let dispatch_receipt = WorkspaceRouterAdapter::dispatch(&envelope, opts).await?;
-    println!("沙箱已就绪: {:?}", dispatch_receipt.sandbox_handle.workspace_path);
+    // 1. 配发物理隔离沙箱
+    let req = WorkspaceProvisionRequest::new("task-01", &repo_root)
+        .with_base_branch("dev")
+        .with_strategy(IsolationStrategy::Worktree)
+        .with_caches(vec![CacheType::CargoTarget, CacheType::NodeModules])
+        .with_injected_configs(vec![".env".to_string()]);
 
-    // 2. 执行确定性门禁自检与自动合并
-    let config = VerifierConfig::builder()
-        .test_command("cargo test")
-        .linter_command("cargo clippy -- -D warnings")
-        .auto_merge_on_pass(true)
-        .target_branch("dev")
-        .build();
+    let handle = orchestrator.provision(&req).await?;
+    println!("沙箱已就绪: {:?}", handle.workspace_path);
 
-    let (receipt, teardown) = WorkspaceVerifier::verify_sandbox(
-        &repo_root,
-        &envelope.task_id,
-        &config,
-        &orchestrator,
-    ).await?;
+    // 2. 在 handle.workspace_path 执行任务修改（由 k0maru-verifier 执行门禁验收）
 
-    println!("验证判定结果: {:?}", receipt.verdict);
-    println!("Diff SHA-256 签名: {:?}", receipt.artifacts.git_patch_sha256);
+    // 3. 门禁通过后触发安全合并与回收
+    let receipt = orchestrator
+        .teardown(
+            &handle.task_id,
+            TeardownAction::Merge {
+                target_branch: "dev".to_string(),
+                squash: true,
+            },
+        )
+        .await?;
+
+    println!("生命周期完成: action={}", receipt.action_taken);
 
     Ok(())
 }
@@ -242,10 +207,9 @@ async fn main() -> anyhow::Result<()> {
   - 深度联动 `k0maru-agent-router`，支持原生 `agent-task-v1` `TaskEnvelope` 工单路由。
   - Herdr & Tmux 窗格自动切分与 Agent 唤醒指令生成。
   - 闭环验证跨仓 Bug 隔离热修复。
-- [x] **Phase 4: 确定性验证器与自动合入门禁**
-  - 契约严格对齐 `agent-receipt-v1.json` 不可变凭证。
-  - 范围防腐门禁（Scope Guard），根据白名单物理拦截越权文件篡改。
-  - Git Diff SHA-256 指纹验签与测试 Exit Code 驱动的原子合并/自动回滚。
+- [x] **Phase 4: 质量门禁解耦与 Harness 边界收敛**
+  - 明确职责边界，将物理测试裁判与收据签署全面解耦至独立工具 `k0maru-agent-verifier`。
+  - 保持工作区引擎精简纯粹，严格收敛于物理沙箱生命周期管理。
 - [x] **Phase 5: 多模式隔离策略与只读直通 (Multi-Strategy Isolation)**
   - `InPlace` 只读直通：针对只读探索与检索任务直接复用主仓 CWD，零分支零开销，Teardown 绝不误删主仓。
   - `TempDir` 纯临时沙箱：针对非 Git 仓库或试运行任务创建瞬态独立目录，支持干净回收。

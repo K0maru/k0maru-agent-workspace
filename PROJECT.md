@@ -28,12 +28,11 @@
 - [x] 3. CLI 拓展：新增 `route` 子命令，支持从 JSON 文件/字符串派发沙箱与窗格；
 - [x] 4. 编写 Phase 3 端到端跨仓工单路由与多路复用器切分测试套件。
 
-## 🧭 研发任务清单 (Phase 4 - Deterministic Verifier & Automated Merge Gate)
-- [x] 1. 实现 `WorkspaceVerifier`：在沙箱 CWD 隔离运行 build, test, linter 与 scope guard 校验；
-- [x] 2. 实现不可变执行凭证 `ExecutionReceipt`：遵循 `agent-receipt-v1.json` 规约，计算 SHA-256 patch 摘要；
-- [x] 3. 实现自动化合并与安全回滚门禁：通过时结合 `--auto-merge` 原子合入目标分支，失败结合 `--auto-rollback` 干净回滚；
-- [x] 4. CLI 拓展：新增 `verify` 子命令，支持人机可读输出与 `--json` 机器执行凭证；
-- [x] 5. 编写 Phase 4 完整单元测试与端到端 CLI 集成测试套件。
+## 🧭 研发任务清单 (Phase 4 - Quality Gate Delegation & Harness Boundary Convergence)
+- [x] 1. 明确架构正交边界：将物理测试裁判与收据签署全面解耦至独立工具 `k0maru-agent-verifier`；
+- [x] 2. 移除内部冗余 `verify` 子命令，确保 Workspace 纯粹聚焦物理工作区生命周期管理；
+- [x] 3. `teardown` 契约强化：与 `k0maru-verifier` 形成正交协同（先执行独立 verifier 门禁，再触发 workspace teardown merge/abort）；
+- [x] 4. 精简依赖树：剔除冗余加解密与摘要计算依赖，保持极简零冗余体积。
 
 ## 🧭 研发任务清单 (Phase 5 - Multi-Strategy Isolation & In-Place Passthrough)
 - [x] 1. 扩充 `SandboxHandle` 结构：引入 `strategy: IsolationStrategy`，确保 `WorkspaceProvisionRequest` 策略无损透传；
