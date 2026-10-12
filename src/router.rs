@@ -1,5 +1,5 @@
 use crate::error::WorkspaceError;
-use crate::handle::{CacheType, SandboxHandle, WorkspaceProvisionRequest};
+use crate::handle::{CacheType, IsolationStrategy, SandboxHandle, WorkspaceProvisionRequest};
 use crate::orchestrator::{WorkspaceManager, WorktreeOrchestrator};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -45,6 +45,8 @@ pub struct TaskEnvelope {
     pub target: TargetInfo,
     pub intent: String,
     pub payload: TaskPayload,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// Terminal Multiplexer Target
@@ -78,6 +80,8 @@ pub struct RouterDispatchOptions {
     pub shared_caches: Vec<CacheType>,
     pub injected_configs: Vec<String>,
     pub execute_multiplexer: bool,
+    #[serde(default)]
+    pub isolate_strategy: Option<IsolationStrategy>,
 }
 
 impl Default for RouterDispatchOptions {
@@ -91,6 +95,7 @@ impl Default for RouterDispatchOptions {
             shared_caches: vec![CacheType::CargoTarget, CacheType::NodeModules],
             injected_configs: Vec::new(),
             execute_multiplexer: false,
+            isolate_strategy: None,
         }
     }
 }
@@ -191,7 +196,23 @@ impl WorkspaceRouterAdapter {
         let task_id = envelope.id.clone();
         let orchestrator = WorktreeOrchestrator::new(&repo_root);
 
+        let isolate_strategy = match opts.isolate_strategy {
+            Some(strategy) => strategy,
+            None => {
+                let is_inplace = envelope.tags.iter().any(|t| {
+                    let s = t.to_ascii_lowercase();
+                    s == "read_only" || s == "in_place" || s == "query"
+                });
+                if is_inplace {
+                    IsolationStrategy::InPlace
+                } else {
+                    IsolationStrategy::Worktree
+                }
+            }
+        };
+
         let mut req = WorkspaceProvisionRequest::new(&task_id, &repo_root)
+            .with_strategy(isolate_strategy)
             .with_caches(opts.shared_caches)
             .with_injected_configs(opts.injected_configs);
 
@@ -304,5 +325,161 @@ mod tests {
         assert!(herdr_cmd.unwrap().starts_with(
             "herdr split --cwd \"/path/to/repo/.worktrees/task-1\" --cmd 'claude \"Fix this bug\"'"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_router_dispatch_strategy_auto_deduction() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path();
+
+        tokio::process::Command::new("git")
+            .current_dir(path)
+            .args(["init", "-b", "main"])
+            .output()
+            .await
+            .unwrap();
+
+        tokio::process::Command::new("git")
+            .current_dir(path)
+            .args(["config", "user.name", "Tester"])
+            .output()
+            .await
+            .unwrap();
+
+        tokio::process::Command::new("git")
+            .current_dir(path)
+            .args(["config", "user.email", "tester@example.com"])
+            .output()
+            .await
+            .unwrap();
+
+        tokio::fs::write(path.join("README.md"), "# Router Test\n")
+            .await
+            .unwrap();
+
+        tokio::process::Command::new("git")
+            .current_dir(path)
+            .args(["add", "."])
+            .output()
+            .await
+            .unwrap();
+
+        tokio::process::Command::new("git")
+            .current_dir(path)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+
+        // 1. Tag "read_only" -> auto-deduces InPlace
+        let mut envelope = TaskEnvelope {
+            schema: None,
+            id: "task_ro_01".into(),
+            created_at: "2026-10-12T00:00:00Z".into(),
+            caller: CallerInfo {
+                workspace: "test".into(),
+                agent: "test".into(),
+                pane_id: None,
+            },
+            target: TargetInfo {
+                identifier: "test".into(),
+                workspace: Some(path.to_str().unwrap().into()),
+                is_external: false,
+            },
+            intent: "query".into(),
+            payload: TaskPayload {
+                title: "Inspect code".into(),
+                severity: "low".into(),
+                reproduction: None,
+                expected: None,
+            },
+            tags: vec!["read_only".into()],
+        };
+
+        let opts = RouterDispatchOptions {
+            target_repo: Some(path.to_path_buf()),
+            ..Default::default()
+        };
+
+        let receipt = WorkspaceRouterAdapter::dispatch(&envelope, opts.clone())
+            .await
+            .expect("dispatch read_only");
+        assert_eq!(receipt.sandbox_handle.strategy, IsolationStrategy::InPlace);
+        assert_eq!(receipt.sandbox_handle.workspace_path, path);
+        assert!(!receipt.sandbox_handle.is_isolated);
+
+        // Teardown
+        let orchestrator = WorktreeOrchestrator::new(path);
+        orchestrator
+            .teardown("task_ro_01", crate::handle::TeardownAction::Abort)
+            .await
+            .unwrap();
+
+        // 2. Tag "in_place" -> auto-deduces InPlace
+        envelope.id = "task_ip_01".into();
+        envelope.tags = vec!["in_place".into()];
+        let receipt_ip = WorkspaceRouterAdapter::dispatch(&envelope, opts.clone())
+            .await
+            .expect("dispatch in_place");
+        assert_eq!(
+            receipt_ip.sandbox_handle.strategy,
+            IsolationStrategy::InPlace
+        );
+
+        orchestrator
+            .teardown("task_ip_01", crate::handle::TeardownAction::Abort)
+            .await
+            .unwrap();
+
+        // 3. Tag "query" -> auto-deduces InPlace
+        envelope.id = "task_query_01".into();
+        envelope.tags = vec!["query".into()];
+        let receipt_q = WorkspaceRouterAdapter::dispatch(&envelope, opts.clone())
+            .await
+            .expect("dispatch query");
+        assert_eq!(
+            receipt_q.sandbox_handle.strategy,
+            IsolationStrategy::InPlace
+        );
+
+        orchestrator
+            .teardown("task_query_01", crate::handle::TeardownAction::Abort)
+            .await
+            .unwrap();
+
+        // 4. No tags -> defaults to Worktree
+        envelope.id = "task_wt_01".into();
+        envelope.tags = Vec::new();
+        let receipt_wt = WorkspaceRouterAdapter::dispatch(&envelope, opts.clone())
+            .await
+            .expect("dispatch default");
+        assert_eq!(
+            receipt_wt.sandbox_handle.strategy,
+            IsolationStrategy::Worktree
+        );
+        assert!(receipt_wt.sandbox_handle.is_isolated);
+
+        orchestrator
+            .teardown("task_wt_01", crate::handle::TeardownAction::Abort)
+            .await
+            .unwrap();
+
+        // 5. Explicit isolate_strategy overrides tags
+        envelope.id = "task_override_01".into();
+        envelope.tags = vec!["read_only".into()];
+        let mut opts_override = opts;
+        opts_override.isolate_strategy = Some(IsolationStrategy::TempDir);
+        let receipt_ov = WorkspaceRouterAdapter::dispatch(&envelope, opts_override)
+            .await
+            .expect("dispatch override");
+        assert_eq!(
+            receipt_ov.sandbox_handle.strategy,
+            IsolationStrategy::TempDir
+        );
+
+        orchestrator
+            .teardown("task_override_01", crate::handle::TeardownAction::Abort)
+            .await
+            .unwrap();
     }
 }

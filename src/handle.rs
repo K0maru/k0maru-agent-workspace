@@ -49,7 +49,9 @@ impl WorkspaceProvisionRequest {
 pub enum IsolationStrategy {
     #[default]
     Worktree,
+    #[serde(alias = "tempdir", alias = "temp-dir")]
     TempDir,
+    #[serde(alias = "inplace", alias = "in-place")]
     InPlace,
 }
 
@@ -73,6 +75,8 @@ pub struct SandboxHandle {
     pub mounted_caches: Vec<CacheType>,
     #[serde(default)]
     pub injected_files: Vec<String>,
+    #[serde(default)]
+    pub strategy: IsolationStrategy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,11 +173,24 @@ mod tests {
             created_at: "2026-10-12T00:00:00Z".into(),
             mounted_caches: vec![CacheType::CargoTarget],
             injected_files: vec![".env".into()],
+            strategy: IsolationStrategy::Worktree,
         };
 
         let json = serde_json::to_string(&handle).unwrap();
         let deserialized: SandboxHandle = serde_json::from_str(&json).unwrap();
         assert_eq!(handle, deserialized);
+
+        // Test backward compatibility without strategy field
+        let legacy_json = r#"{
+            "task_id": "legacy-01",
+            "workspace_path": "/tmp/legacy",
+            "branch_name": "feat/legacy-01",
+            "base_branch": null,
+            "is_isolated": true,
+            "created_at": "2026-10-12T00:00:00Z"
+        }"#;
+        let legacy_handle: SandboxHandle = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy_handle.strategy, IsolationStrategy::Worktree);
 
         let receipt = TeardownReceipt {
             task_id: "task-01".into(),

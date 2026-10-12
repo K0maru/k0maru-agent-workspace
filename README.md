@@ -246,6 +246,10 @@ async fn main() -> anyhow::Result<()> {
   - Deterministic physical test oracle (`agent-receipt-v1.json` compliance).
   - Scope guard verifying modified files against authorized whitelists.
   - SHA-256 patch fingerprinting and automated atomic merge on zero-exit-code verification.
+- [x] **Phase 5: Multi-Strategy Isolation & In-Place Passthrough**
+  - `InPlace` zero-overhead direct passthrough for read-only exploration with safe no-op teardown.
+  - `TempDir` ephemeral filesystem directory isolation for non-git scratch scripts.
+  - Automated strategy deduction in `WorkspaceRouterAdapter` based on task envelope tags (`read_only`, `in_place`, `query`).
 
 ---
 

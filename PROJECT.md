@@ -34,3 +34,12 @@
 - [x] 3. 实现自动化合并与安全回滚门禁：通过时结合 `--auto-merge` 原子合入目标分支，失败结合 `--auto-rollback` 干净回滚；
 - [x] 4. CLI 拓展：新增 `verify` 子命令，支持人机可读输出与 `--json` 机器执行凭证；
 - [x] 5. 编写 Phase 4 完整单元测试与端到端 CLI 集成测试套件。
+
+## 🧭 研发任务清单 (Phase 5 - Multi-Strategy Isolation & In-Place Passthrough)
+- [x] 1. 扩充 `SandboxHandle` 结构：引入 `strategy: IsolationStrategy`，确保 `WorkspaceProvisionRequest` 策略无损透传；
+- [x] 2. 实现 `IsolationStrategy::InPlace` 原地穿透：动态发现分支、零 Worktree 与无新分支开销、Teardown 安全空操作（绝对不删 repo_root）；
+- [x] 3. 实现 `IsolationStrategy::TempDir` 临时目录隔离：利用 OS 临时目录瞬态就绪、支持依赖挂载、Teardown 自动干净移除；
+- [x] 4. 智能策略推断与路由适配：`WorkspaceRouterAdapter` 识别 `read_only`、`in_place`、`query` 标签自动推断 InPlace 策略，支持显式覆盖；
+- [x] 5. CLI 拓展：`provision` 与 `route` 子命令支持 `--strategy <worktree|inplace|tempdir>`；
+- [x] 6. 编写 Phase 5 完整单元测试与端到端集成测试套件。
+

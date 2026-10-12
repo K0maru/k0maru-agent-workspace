@@ -62,6 +62,7 @@ async fn test_dispatch_envelope_end_to_end() {
             })),
             expected: Some("Handle None gracefully with typed WorkspaceError".into()),
         },
+        tags: Vec::new(),
     };
 
     let opts = RouterDispatchOptions {
@@ -73,6 +74,7 @@ async fn test_dispatch_envelope_end_to_end() {
         shared_caches: Vec::new(),
         injected_configs: Vec::new(),
         execute_multiplexer: false,
+        isolate_strategy: None,
     };
 
     let receipt = WorkspaceRouterAdapter::dispatch(&envelope, opts)
