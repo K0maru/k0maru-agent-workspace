@@ -42,3 +42,11 @@
 - [x] 5. CLI 拓展：`provision` 与 `route` 子命令支持 `--strategy <worktree|inplace|tempdir>`；
 - [x] 6. 编写 Phase 5 完整单元测试与端到端集成测试套件。
 
+## 🧭 研发任务清单 (Phase 6 - Physical No-Receipt-No-Merge Invariant & Security Gate)
+- [x] 1. 架构级铁律物理固化：在 `WorktreeOrchestrator::teardown` 触发 `TeardownAction::Merge` 时物理拦截无收据合并行为；
+- [x] 2. 验签收据语义与完整性：解析 `agent-receipt-v1.json`，核验 `verdict == "success"`，校验 SHA-256 Git Diff Patch 摘要防篡改；
+- [x] 3. 收据检索路径阶梯匹配：支持 `$K0MARU_RECEIPT_DIR` 环境变量、`~/.k0maru/receipts`、`.worktrees/.receipts` 及工作区相对路径；
+- [x] 4. 应急逃生与类型化错误：新增 `--force` 绕过标志用于人工紧急合并，默认拒绝时抛出 `WorkspaceError::VerificationReceiptRequired` 并在 CLI 返回退出码 1；
+- [x] 5. 编写 Phase 6 缺失收据拦截、失败收据拦截、篡改摘要拦截、有效收据放行、`--force` 绕过等完整集成测试套件。
+
+
