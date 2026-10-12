@@ -117,7 +117,58 @@ k0maru-workspace route \
   --json
 ```
 
-### 6. Prune Stale Sandboxes (GC)
+### 6. Verify Sandbox & Deterministic Auto-Merge Gate
+
+Run physical test oracles (`cargo test`, `pytest`, `npm test`) inside the isolated sandbox. If all checks pass, optionally auto-merge the changes and prune the sandbox:
+
+```bash
+# Verify with custom test command, auto-merge on pass, and auto-rollback on fail
+k0maru-workspace verify \
+  --task-id task_01 \
+  --repo /path/to/repo \
+  --test-cmd "cargo test" \
+  --linter-cmd "cargo clippy -- -D warnings" \
+  --allowed-files "src/*,tests/*" \
+  --auto-merge \
+  --auto-rollback \
+  --target-branch dev \
+  --json
+```
+
+Output:
+```json
+{
+  "$schema": "https://k0maru.dev/schemas/agent-receipt-v1.json",
+  "task_id": "task_01",
+  "workspace": "/path/to/repo/.worktrees/task_01",
+  "verdict": "success",
+  "checks": {
+    "tests": {
+      "status": "passed",
+      "command": "cargo test",
+      "exit_code": 0,
+      "duration_ms": 1420
+    },
+    "linter": {
+      "status": "passed",
+      "command": "cargo clippy -- -D warnings",
+      "exit_code": 0,
+      "duration_ms": 860
+    },
+    "scope_guard": {
+      "status": "passed",
+      "modified_files": ["src/lib.rs", "tests/lib_test.rs"],
+      "unauthorized_files": []
+    }
+  },
+  "artifacts": {
+    "git_patch_sha256": "4a7d189f76c5b0...",
+    "receipt_timestamp": "2026-10-12T14:40:00Z"
+  }
+}
+```
+
+### 7. Prune Stale Sandboxes (GC)
 
 ```bash
 # Prune sandboxes older than 24 hours (default 86400s)
@@ -136,11 +187,13 @@ use k0maru_workspace::orchestrator::{WorkspaceManager, WorktreeOrchestrator};
 use k0maru_workspace::router::{
     AgentType, MultiplexerType, RouterDispatchOptions, TaskEnvelope, WorkspaceRouterAdapter,
 };
+use k0maru_workspace::verifier::{VerifierConfig, WorkspaceVerifier};
 use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let repo_root = PathBuf::from("/path/to/repo");
+    let orchestrator = WorktreeOrchestrator::new();
 
     // 1. Route task envelope directly from k0maru-agent-router
     let envelope: TaskEnvelope = serde_json::from_str(r#"{ ... }"#)?;
@@ -149,9 +202,26 @@ async fn main() -> anyhow::Result<()> {
         agent: AgentType::Agy,
         ..Default::default()
     };
-    let receipt = WorkspaceRouterAdapter::dispatch(&envelope, opts).await?;
-    println!("Sandbox provisioned at: {:?}", receipt.sandbox_handle.workspace_path);
-    println!("Multiplexer command: {:?}", receipt.multiplexer_command);
+    let dispatch_receipt = WorkspaceRouterAdapter::dispatch(&envelope, opts).await?;
+    println!("Sandbox provisioned at: {:?}", dispatch_receipt.sandbox_handle.workspace_path);
+
+    // 2. Deterministic Verification & Auto-Merge Gate
+    let config = VerifierConfig::builder()
+        .test_command("cargo test")
+        .linter_command("cargo clippy -- -D warnings")
+        .auto_merge_on_pass(true)
+        .target_branch("dev")
+        .build();
+
+    let (receipt, teardown) = WorkspaceVerifier::verify_sandbox(
+        &repo_root,
+        &envelope.task_id,
+        &config,
+        &orchestrator,
+    ).await?;
+
+    println!("Verification Verdict: {:?}", receipt.verdict);
+    println!("SHA-256 Patch Digest: {:?}", receipt.artifacts.git_patch_sha256);
 
     Ok(())
 }
@@ -168,15 +238,18 @@ async fn main() -> anyhow::Result<()> {
   - Shared symlinks for Cargo `target/`, Node `node_modules`, and Python venvs.
   - Safe unlinking on teardown to prevent parent repository cache corruption.
   - Custom environment (`.env`) and MCP server config injection.
-- [x] **Phase 3: Router & Multiplexer Integration** (Current)
+- [x] **Phase 3: Router & Multiplexer Integration**
   - Direct integration with `k0maru-agent-router` via `agent-task-v1` `TaskEnvelope`.
   - Herdr & Tmux pane splitting and prompt injection command generation.
   - Automated cross-repo hotfix isolation.
-- [ ] **Phase 4: Autonomous Verifier & Auto-Merge**
-  - Automated test execution before merge gate.
+- [x] **Phase 4: Autonomous Verifier & Auto-Merge Gate**
+  - Deterministic physical test oracle (`agent-receipt-v1.json` compliance).
+  - Scope guard verifying modified files against authorized whitelists.
+  - SHA-256 patch fingerprinting and automated atomic merge on zero-exit-code verification.
 
 ---
 
 ## 🛡️ License
 
 Apache-2.0 / MIT
+

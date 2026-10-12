@@ -99,7 +99,7 @@ impl WorktreeOrchestrator {
         Self::run_git_in(&self.repo_root, args).await
     }
 
-    async fn branch_exists(&self, branch_name: &str) -> bool {
+    pub async fn branch_exists(&self, branch_name: &str) -> bool {
         let ref_path = format!("refs/heads/{}", branch_name);
         Self::run_git_in(
             &self.repo_root,
