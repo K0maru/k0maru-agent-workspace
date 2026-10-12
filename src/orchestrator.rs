@@ -437,6 +437,22 @@ impl WorkspaceManager for WorktreeOrchestrator {
 
         match strategy {
             IsolationStrategy::InPlace => {
+                if let TeardownAction::Merge {
+                    ref target_branch,
+                    force,
+                    ..
+                } = action
+                {
+                    if !force {
+                        crate::receipt::verify_receipt_for_merge(
+                            &self.repo_root,
+                            &self.repo_root,
+                            task_id,
+                            target_branch,
+                        )
+                        .await?;
+                    }
+                }
                 // Safe no-op! MUST NEVER delete repo_root or delete branches.
                 self.remove_metadata(task_id).await;
                 Ok(TeardownReceipt {
@@ -518,7 +534,18 @@ impl WorkspaceManager for WorktreeOrchestrator {
                     TeardownAction::Merge {
                         target_branch,
                         squash,
+                        force,
                     } => {
+                        if !force {
+                            crate::receipt::verify_receipt_for_merge(
+                                &self.repo_root,
+                                &target_path,
+                                task_id,
+                                &target_branch,
+                            )
+                            .await?;
+                        }
+
                         if !self.branch_exists(&target_branch).await {
                             return Err(WorkspaceError::BranchError(format!(
                                 "Target branch '{}' does not exist",
@@ -794,6 +821,7 @@ mod tests {
                 TeardownAction::Merge {
                     target_branch: "main".into(),
                     squash: false,
+                    force: true,
                 },
             )
             .await
