@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use k0maru_workspace::handle::{TeardownAction, WorkspaceProvisionRequest};
+use k0maru_workspace::handle::{CacheType, TeardownAction, WorkspaceProvisionRequest};
 use k0maru_workspace::orchestrator::{WorkspaceManager, WorktreeOrchestrator};
 use std::path::PathBuf;
 
@@ -24,6 +24,10 @@ enum Commands {
         repo: PathBuf,
         #[arg(long)]
         base: Option<String>,
+        #[arg(long, value_enum)]
+        cache: Vec<CacheArg>,
+        #[arg(long)]
+        inject: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -67,6 +71,23 @@ enum ActionArg {
     Retain,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheArg {
+    Cargo,
+    Node,
+    Python,
+}
+
+impl From<CacheArg> for CacheType {
+    fn from(arg: CacheArg) -> Self {
+        match arg {
+            CacheArg::Cargo => Self::CargoTarget,
+            CacheArg::Node => Self::NodeModules,
+            CacheArg::Python => Self::PythonVenv,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -76,10 +97,16 @@ async fn main() -> anyhow::Result<()> {
             task_id,
             repo,
             base,
+            cache,
+            inject,
             json,
         } => {
             let orchestrator = WorktreeOrchestrator::new(&repo);
-            let mut req = WorkspaceProvisionRequest::new(&task_id, &repo);
+            let shared_caches: Vec<CacheType> = cache.into_iter().map(Into::into).collect();
+            let mut req = WorkspaceProvisionRequest::new(&task_id, &repo)
+                .with_caches(shared_caches)
+                .with_injected_configs(inject);
+
             if let Some(base_branch) = base {
                 req = req.with_base_branch(base_branch);
             }
@@ -96,6 +123,12 @@ async fn main() -> anyhow::Result<()> {
                             "  Base Branch:    {}",
                             handle.base_branch.as_deref().unwrap_or("HEAD")
                         );
+                        if !handle.mounted_caches.is_empty() {
+                            println!("  Mounted Caches: {:?}", handle.mounted_caches);
+                        }
+                        if !handle.injected_files.is_empty() {
+                            println!("  Injected Files: {:?}", handle.injected_files);
+                        }
                     }
                 }
                 Err(err) => {
@@ -136,6 +169,9 @@ async fn main() -> anyhow::Result<()> {
                         println!("  Branch Deleted: {}", receipt.branch_deleted);
                         if let Some(commit) = &receipt.merge_commit {
                             println!("  Merge Commit:   {}", commit);
+                        }
+                        if !receipt.unmounted_caches.is_empty() {
+                            println!("  Unmounted Caches: {:?}", receipt.unmounted_caches);
                         }
                         println!("  Duration:       {}ms", receipt.duration_ms);
                     }

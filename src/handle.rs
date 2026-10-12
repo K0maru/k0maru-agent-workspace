@@ -8,6 +8,7 @@ pub struct WorkspaceProvisionRequest {
     pub base_branch: Option<String>,
     pub isolate_strategy: IsolationStrategy,
     pub shared_caches: Vec<CacheType>,
+    pub injected_configs: Vec<String>,
 }
 
 impl WorkspaceProvisionRequest {
@@ -18,6 +19,7 @@ impl WorkspaceProvisionRequest {
             base_branch: None,
             isolate_strategy: IsolationStrategy::Worktree,
             shared_caches: Vec::new(),
+            injected_configs: Vec::new(),
         }
     }
 
@@ -33,6 +35,11 @@ impl WorkspaceProvisionRequest {
 
     pub fn with_caches(mut self, caches: Vec<CacheType>) -> Self {
         self.shared_caches = caches;
+        self
+    }
+
+    pub fn with_injected_configs(mut self, configs: Vec<String>) -> Self {
+        self.injected_configs = configs;
         self
     }
 }
@@ -62,6 +69,10 @@ pub struct SandboxHandle {
     pub base_branch: Option<String>,
     pub is_isolated: bool,
     pub created_at: String,
+    #[serde(default)]
+    pub mounted_caches: Vec<CacheType>,
+    #[serde(default)]
+    pub injected_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +95,8 @@ pub struct TeardownReceipt {
     pub branch_deleted: bool,
     pub merge_commit: Option<String>,
     pub duration_ms: u64,
+    #[serde(default)]
+    pub unmounted_caches: Vec<CacheType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,12 +126,14 @@ mod tests {
         let req = WorkspaceProvisionRequest::new("task-42", "/tmp/repo")
             .with_base_branch("main")
             .with_strategy(IsolationStrategy::Worktree)
-            .with_caches(vec![CacheType::CargoTarget]);
+            .with_caches(vec![CacheType::CargoTarget])
+            .with_injected_configs(vec![".env".into()]);
 
         assert_eq!(req.task_id, "task-42");
         assert_eq!(req.base_branch.as_deref(), Some("main"));
         assert_eq!(req.isolate_strategy, IsolationStrategy::Worktree);
         assert_eq!(req.shared_caches, vec![CacheType::CargoTarget]);
+        assert_eq!(req.injected_configs, vec![".env".to_string()]);
 
         let json = serde_json::to_string(&req).expect("serialize");
         let deserialized: WorkspaceProvisionRequest =
@@ -152,6 +167,8 @@ mod tests {
             base_branch: Some("dev".into()),
             is_isolated: true,
             created_at: "2026-10-12T00:00:00Z".into(),
+            mounted_caches: vec![CacheType::CargoTarget],
+            injected_files: vec![".env".into()],
         };
 
         let json = serde_json::to_string(&handle).unwrap();
@@ -165,6 +182,7 @@ mod tests {
             branch_deleted: true,
             merge_commit: Some("abcdef123".into()),
             duration_ms: 120,
+            unmounted_caches: vec![CacheType::CargoTarget],
         };
         let receipt_json = serde_json::to_string(&receipt).unwrap();
         let deserialized_receipt: TeardownReceipt = serde_json::from_str(&receipt_json).unwrap();
