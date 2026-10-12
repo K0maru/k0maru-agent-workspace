@@ -21,3 +21,9 @@
 - [x] 3. 增强原子清理契约：在沙箱删除与回滚前显式安全解除挂载（`cleanup_mounts`），严防误删主仓共享缓存目录；
 - [x] 4. CLI 拓展：`provision` 支持 `--cache <cargo|node|python>` 与 `--inject <file>` 参数；
 - [x] 5. 编写 Phase 2 缓存挂载、配置注入与安全回滚的完整集成测试套件。
+
+## 🧭 研发任务清单 (Phase 3 - Router & Multiplexer Adapter)
+- [x] 1. 实现 `WorkspaceRouterAdapter`：支持接收 `agent-task-v1` 标准 `TaskEnvelope` 自动配发物理隔离工作区；
+- [x] 2. 实现终端多路复用器（Tmux / Herdr）绑定：支持自动生成分屏指令与 Agent（`agy` / `claude-code`）引导命令；
+- [x] 3. CLI 拓展：新增 `route` 子命令，支持从 JSON 文件/字符串派发沙箱与窗格；
+- [x] 4. 编写 Phase 3 端到端跨仓工单路由与多路复用器切分测试套件。

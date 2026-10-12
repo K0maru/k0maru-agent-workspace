@@ -1,7 +1,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use k0maru_workspace::handle::{CacheType, TeardownAction, WorkspaceProvisionRequest};
 use k0maru_workspace::orchestrator::{WorkspaceManager, WorktreeOrchestrator};
-use std::path::PathBuf;
+use k0maru_workspace::router::{
+    AgentType, MultiplexerType, RouterDispatchOptions, TaskEnvelope, WorkspaceRouterAdapter,
+};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "k0maru-workspace")]
@@ -28,6 +31,39 @@ enum Commands {
         cache: Vec<CacheArg>,
         #[arg(long)]
         inject: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Route a TaskEnvelope from k0maru-agent-router, provisioning sandbox and binding multiplexer
+    Route {
+        /// Path to TaskEnvelope JSON file or inline JSON string
+        #[arg(long)]
+        envelope: String,
+        /// Override target repository root
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Override base branch
+        #[arg(long)]
+        base: Option<String>,
+        /// Multiplexer backend (tmux, herdr, none)
+        #[arg(long, value_enum, default_value_t = MultiplexerArg::None)]
+        multiplexer: MultiplexerArg,
+        /// Target agent (agy, claude-code, custom)
+        #[arg(long, value_enum, default_value_t = AgentArg::Agy)]
+        agent: AgentArg,
+        /// Custom agent command if agent is custom
+        #[arg(long)]
+        cmd: Option<String>,
+        /// Shared caches to mount
+        #[arg(long, value_enum)]
+        cache: Vec<CacheArg>,
+        /// Injected configuration files
+        #[arg(long)]
+        inject: Vec<String>,
+        /// Execute multiplexer split command immediately
+        #[arg(long)]
+        spawn: bool,
+        /// Output machine-readable JSON receipt
         #[arg(long)]
         json: bool,
     },
@@ -88,6 +124,40 @@ impl From<CacheArg> for CacheType {
     }
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum MultiplexerArg {
+    None,
+    Tmux,
+    Herdr,
+}
+
+impl From<MultiplexerArg> for MultiplexerType {
+    fn from(arg: MultiplexerArg) -> Self {
+        match arg {
+            MultiplexerArg::None => Self::None,
+            MultiplexerArg::Tmux => Self::Tmux,
+            MultiplexerArg::Herdr => Self::Herdr,
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentArg {
+    Agy,
+    ClaudeCode,
+    Custom,
+}
+
+impl From<AgentArg> for AgentType {
+    fn from(arg: AgentArg) -> Self {
+        match arg {
+            AgentArg::Agy => Self::Agy,
+            AgentArg::ClaudeCode => Self::ClaudeCode,
+            AgentArg::Custom => Self::Custom,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -133,6 +203,79 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(err) => {
                     eprintln!("Error provisioning workspace: {}", err);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Route {
+            envelope,
+            repo,
+            base,
+            multiplexer,
+            agent,
+            cmd,
+            cache,
+            inject,
+            spawn,
+            json,
+        } => {
+            let envelope_content = if Path::new(&envelope).exists() {
+                tokio::fs::read_to_string(&envelope).await?
+            } else {
+                envelope
+            };
+
+            let task_envelope: TaskEnvelope = match serde_json::from_str(&envelope_content) {
+                Ok(env) => env,
+                Err(e) => {
+                    eprintln!("Failed to parse TaskEnvelope: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let shared_caches = if cache.is_empty() {
+                vec![CacheType::CargoTarget, CacheType::NodeModules]
+            } else {
+                cache.into_iter().map(Into::into).collect()
+            };
+
+            let opts = RouterDispatchOptions {
+                target_repo: repo,
+                base_branch: base,
+                multiplexer: multiplexer.into(),
+                agent: agent.into(),
+                custom_agent_cmd: cmd,
+                shared_caches,
+                injected_configs: inject,
+                execute_multiplexer: spawn,
+            };
+
+            match WorkspaceRouterAdapter::dispatch(&task_envelope, opts).await {
+                Ok(receipt) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&receipt)?);
+                    } else {
+                        println!(
+                            "Successfully routed TaskEnvelope '{}':",
+                            receipt.envelope_id
+                        );
+                        println!(
+                            "  Sandbox Path:        {}",
+                            receipt.sandbox_handle.workspace_path.display()
+                        );
+                        println!(
+                            "  Sandbox Branch:      {}",
+                            receipt.sandbox_handle.branch_name
+                        );
+                        println!("  Multiplexer:         {:?}", receipt.multiplexer_type);
+                        if let Some(cmd) = &receipt.multiplexer_command {
+                            println!("  Multiplexer Command: {}", cmd);
+                        }
+                        println!("  Pane Spawned:        {}", receipt.pane_spawned);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Error routing TaskEnvelope: {}", err);
                     std::process::exit(1);
                 }
             }
