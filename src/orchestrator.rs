@@ -1,8 +1,8 @@
 use crate::env::EnvironmentManager;
 use crate::error::WorkspaceError;
 use crate::handle::{
-    PruneReport, SandboxHandle, TeardownAction, TeardownReceipt, WorkspaceProvisionRequest,
-    WorktreeInfo,
+    IsolationStrategy, PruneReport, SandboxHandle, TeardownAction, TeardownReceipt,
+    WorkspaceProvisionRequest, WorktreeInfo,
 };
 use async_trait::async_trait;
 use regex::Regex;
@@ -108,6 +108,57 @@ impl WorktreeOrchestrator {
         .await
         .is_ok()
     }
+
+    pub fn metadata_dir(&self) -> PathBuf {
+        self.worktrees_dir().join(".metadata")
+    }
+
+    pub fn metadata_path(&self, task_id: &str) -> PathBuf {
+        self.metadata_dir().join(format!("{}.json", task_id))
+    }
+
+    pub async fn save_metadata(&self, handle: &SandboxHandle) -> Result<(), WorkspaceError> {
+        let dir = self.metadata_dir();
+        if !dir.exists() {
+            fs::create_dir_all(&dir).await?;
+        }
+        let json = serde_json::to_string_pretty(handle).map_err(|e| {
+            WorkspaceError::GitError(format!("Failed to serialize metadata: {}", e))
+        })?;
+        fs::write(self.metadata_path(&handle.task_id), json).await?;
+        Ok(())
+    }
+
+    pub async fn load_metadata(&self, task_id: &str) -> Option<SandboxHandle> {
+        let path = self.metadata_path(task_id);
+        if !path.exists() {
+            return None;
+        }
+        let content = fs::read_to_string(path).await.ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    pub async fn remove_metadata(&self, task_id: &str) {
+        let path = self.metadata_path(task_id);
+        if path.exists() {
+            let _ = fs::remove_file(path).await;
+        }
+    }
+
+    pub fn find_os_temp_dir(task_id: &str) -> Option<PathBuf> {
+        let prefix = format!("k0maru-temp-{}-", task_id);
+        let os_temp = std::env::temp_dir();
+        if let Ok(entries) = std::fs::read_dir(&os_temp) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(&prefix) {
+                        return Some(entry.path());
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 #[async_trait]
@@ -118,87 +169,183 @@ impl WorkspaceManager for WorktreeOrchestrator {
     ) -> Result<SandboxHandle, WorkspaceError> {
         Self::validate_task_id(&req.task_id)?;
 
-        let worktrees_dir = self.worktrees_dir();
-        let target_path = self.task_worktree_path(&req.task_id);
-        let branch_name = Self::branch_name_for_task(&req.task_id);
-
-        if target_path.exists() {
+        if self.load_metadata(&req.task_id).await.is_some() {
             return Err(WorkspaceError::AlreadyExists {
                 task_id: req.task_id.clone(),
-                path: target_path.display().to_string(),
+                path: format!("Task '{}' already active", req.task_id),
             });
         }
 
-        if self.branch_exists(&branch_name).await {
-            return Err(WorkspaceError::AlreadyExists {
-                task_id: req.task_id.clone(),
-                path: format!("branch '{}' already exists", branch_name),
-            });
-        }
+        match req.isolate_strategy {
+            IsolationStrategy::InPlace => {
+                let branch_name = match self.run_git(&["rev-parse", "--abbrev-ref", "HEAD"]).await {
+                    Ok(b) if !b.is_empty() => b,
+                    _ => req
+                        .base_branch
+                        .clone()
+                        .unwrap_or_else(|| "HEAD".to_string()),
+                };
 
-        if !worktrees_dir.exists() {
-            fs::create_dir_all(&worktrees_dir).await?;
-        }
+                let handle = SandboxHandle {
+                    task_id: req.task_id.clone(),
+                    workspace_path: self.repo_root.clone(),
+                    branch_name,
+                    base_branch: req.base_branch.clone(),
+                    is_isolated: false,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    mounted_caches: Vec::new(),
+                    injected_files: Vec::new(),
+                    strategy: IsolationStrategy::InPlace,
+                };
 
-        let base_ref = req.base_branch.as_deref().unwrap_or("HEAD");
-        let path_str = target_path.to_string_lossy().to_string();
-
-        let add_res = self
-            .run_git(&["worktree", "add", "-b", &branch_name, &path_str, base_ref])
-            .await;
-
-        if let Err(e) = add_res {
-            // Atomic rollback
-            let _ = EnvironmentManager::cleanup_mounts(&target_path);
-            let _ = self
-                .run_git(&["worktree", "remove", "--force", &path_str])
-                .await;
-            let _ = self.run_git(&["branch", "-D", &branch_name]).await;
-            if target_path.exists() {
-                let _ = fs::remove_dir_all(&target_path).await;
+                self.save_metadata(&handle).await?;
+                Ok(handle)
             }
-            return Err(e);
-        }
-
-        let mounted_caches = match EnvironmentManager::mount_caches(
-            &self.repo_root,
-            &target_path,
-            &req.shared_caches,
-        )
-        .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                let _ = EnvironmentManager::cleanup_mounts(&target_path);
-                let _ = self
-                    .run_git(&["worktree", "remove", "--force", &path_str])
-                    .await;
-                let _ = self.run_git(&["branch", "-D", &branch_name]).await;
-                if target_path.exists() {
-                    let _ = fs::remove_dir_all(&target_path).await;
+            IsolationStrategy::TempDir => {
+                if Self::find_os_temp_dir(&req.task_id).is_some() {
+                    return Err(WorkspaceError::AlreadyExists {
+                        task_id: req.task_id.clone(),
+                        path: format!("Temp directory for task '{}' already exists", req.task_id),
+                    });
                 }
-                return Err(e);
+
+                #[allow(deprecated)]
+                let temp_path = tempfile::Builder::new()
+                    .prefix(&format!("k0maru-temp-{}-", req.task_id))
+                    .tempdir()
+                    .map_err(WorkspaceError::IoError)?
+                    .into_path();
+
+                let mounted_caches = match EnvironmentManager::mount_caches(
+                    &self.repo_root,
+                    &temp_path,
+                    &req.shared_caches,
+                )
+                .await
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let _ = EnvironmentManager::cleanup_mounts(&temp_path);
+                        if temp_path.exists() {
+                            let _ = fs::remove_dir_all(&temp_path).await;
+                        }
+                        return Err(e);
+                    }
+                };
+
+                let injected_files = EnvironmentManager::inject_configs(
+                    &self.repo_root,
+                    &temp_path,
+                    &req.injected_configs,
+                )
+                .await
+                .unwrap_or_default();
+
+                let branch_name = Self::branch_name_for_task(&req.task_id);
+
+                let handle = SandboxHandle {
+                    task_id: req.task_id.clone(),
+                    workspace_path: temp_path,
+                    branch_name,
+                    base_branch: req.base_branch.clone(),
+                    is_isolated: true,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    mounted_caches,
+                    injected_files,
+                    strategy: IsolationStrategy::TempDir,
+                };
+
+                self.save_metadata(&handle).await?;
+                Ok(handle)
             }
-        };
+            IsolationStrategy::Worktree => {
+                let worktrees_dir = self.worktrees_dir();
+                let target_path = self.task_worktree_path(&req.task_id);
+                let branch_name = Self::branch_name_for_task(&req.task_id);
 
-        let injected_files = EnvironmentManager::inject_configs(
-            &self.repo_root,
-            &target_path,
-            &req.injected_configs,
-        )
-        .await
-        .unwrap_or_default();
+                if target_path.exists() {
+                    return Err(WorkspaceError::AlreadyExists {
+                        task_id: req.task_id.clone(),
+                        path: target_path.display().to_string(),
+                    });
+                }
 
-        Ok(SandboxHandle {
-            task_id: req.task_id.clone(),
-            workspace_path: target_path,
-            branch_name,
-            base_branch: req.base_branch.clone(),
-            is_isolated: true,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            mounted_caches,
-            injected_files,
-        })
+                if self.branch_exists(&branch_name).await {
+                    return Err(WorkspaceError::AlreadyExists {
+                        task_id: req.task_id.clone(),
+                        path: format!("branch '{}' already exists", branch_name),
+                    });
+                }
+
+                if !worktrees_dir.exists() {
+                    fs::create_dir_all(&worktrees_dir).await?;
+                }
+
+                let base_ref = req.base_branch.as_deref().unwrap_or("HEAD");
+                let path_str = target_path.to_string_lossy().to_string();
+
+                let add_res = self
+                    .run_git(&["worktree", "add", "-b", &branch_name, &path_str, base_ref])
+                    .await;
+
+                if let Err(e) = add_res {
+                    // Atomic rollback
+                    let _ = EnvironmentManager::cleanup_mounts(&target_path);
+                    let _ = self
+                        .run_git(&["worktree", "remove", "--force", &path_str])
+                        .await;
+                    let _ = self.run_git(&["branch", "-D", &branch_name]).await;
+                    if target_path.exists() {
+                        let _ = fs::remove_dir_all(&target_path).await;
+                    }
+                    return Err(e);
+                }
+
+                let mounted_caches = match EnvironmentManager::mount_caches(
+                    &self.repo_root,
+                    &target_path,
+                    &req.shared_caches,
+                )
+                .await
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let _ = EnvironmentManager::cleanup_mounts(&target_path);
+                        let _ = self
+                            .run_git(&["worktree", "remove", "--force", &path_str])
+                            .await;
+                        let _ = self.run_git(&["branch", "-D", &branch_name]).await;
+                        if target_path.exists() {
+                            let _ = fs::remove_dir_all(&target_path).await;
+                        }
+                        return Err(e);
+                    }
+                };
+
+                let injected_files = EnvironmentManager::inject_configs(
+                    &self.repo_root,
+                    &target_path,
+                    &req.injected_configs,
+                )
+                .await
+                .unwrap_or_default();
+
+                let handle = SandboxHandle {
+                    task_id: req.task_id.clone(),
+                    workspace_path: target_path,
+                    branch_name,
+                    base_branch: req.base_branch.clone(),
+                    is_isolated: true,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    mounted_caches,
+                    injected_files,
+                    strategy: IsolationStrategy::Worktree,
+                };
+
+                self.save_metadata(&handle).await?;
+                Ok(handle)
+            }
+        }
     }
 
     async fn list_sandboxes(&self) -> Result<Vec<WorktreeInfo>, WorkspaceError> {
@@ -269,117 +416,182 @@ impl WorkspaceManager for WorktreeOrchestrator {
         Self::validate_task_id(task_id)?;
         let start_time = Instant::now();
 
-        let target_path = self.task_worktree_path(task_id);
-        let branch_name = Self::branch_name_for_task(task_id);
+        // 1. Check if metadata was recorded for this task
+        let meta_opt = self.load_metadata(task_id).await;
 
-        if !target_path.exists() && !self.branch_exists(&branch_name).await {
-            return Err(WorkspaceError::NotFound {
-                task_id: task_id.to_string(),
-            });
-        }
+        // 2. Identify strategy and path
+        let (strategy, ws_path) = if let Some(meta) = &meta_opt {
+            (meta.strategy, meta.workspace_path.clone())
+        } else if let Some(temp_path) = Self::find_os_temp_dir(task_id) {
+            (IsolationStrategy::TempDir, temp_path)
+        } else {
+            let target_path = self.task_worktree_path(task_id);
+            let branch_name = Self::branch_name_for_task(task_id);
+            if !target_path.exists() && !self.branch_exists(&branch_name).await {
+                return Err(WorkspaceError::NotFound {
+                    task_id: task_id.to_string(),
+                });
+            }
+            (IsolationStrategy::Worktree, target_path)
+        };
 
-        let path_str = target_path.to_string_lossy().to_string();
-
-        match action {
-            TeardownAction::Abort => {
-                let unmounted_caches =
-                    EnvironmentManager::cleanup_mounts(&target_path).unwrap_or_default();
-                if target_path.exists() {
-                    let _ = self
-                        .run_git(&["worktree", "remove", "--force", &path_str])
-                        .await;
-                    if target_path.exists() {
-                        let _ = fs::remove_dir_all(&target_path).await;
-                    }
-                }
-                let branch_deleted = if self.branch_exists(&branch_name).await {
-                    self.run_git(&["branch", "-D", &branch_name]).await.is_ok()
-                } else {
-                    false
-                };
-
+        match strategy {
+            IsolationStrategy::InPlace => {
+                // Safe no-op! MUST NEVER delete repo_root or delete branches.
+                self.remove_metadata(task_id).await;
                 Ok(TeardownReceipt {
                     task_id: task_id.to_string(),
-                    action_taken: "aborted".to_string(),
-                    workspace_path: target_path,
-                    branch_deleted,
+                    action_taken: "in-place workspace completed without deletion".to_string(),
+                    workspace_path: self.repo_root.clone(),
+                    branch_deleted: false,
                     merge_commit: None,
                     duration_ms: start_time.elapsed().as_millis() as u64,
-                    unmounted_caches,
+                    unmounted_caches: Vec::new(),
                 })
             }
-            TeardownAction::Merge {
-                target_branch,
-                squash,
-            } => {
-                if !self.branch_exists(&target_branch).await {
-                    return Err(WorkspaceError::BranchError(format!(
-                        "Target branch '{}' does not exist",
-                        target_branch
-                    )));
-                }
-
-                // Switch repo_root to target_branch
-                self.run_git(&["checkout", &target_branch]).await?;
-
-                let merge_res = if squash {
-                    let res = self.run_git(&["merge", "--squash", &branch_name]).await;
-                    if res.is_ok() {
-                        let commit_msg =
-                            format!("feat({}): squash merge task {}", task_id, task_id);
-                        self.run_git(&["commit", "-m", &commit_msg]).await
-                    } else {
-                        res
-                    }
-                } else {
-                    let commit_msg =
-                        format!("Merge branch '{}' into {}", branch_name, target_branch);
-                    self.run_git(&["merge", "--no-ff", "-m", &commit_msg, &branch_name])
-                        .await
-                };
-
-                if let Err(e) = merge_res {
-                    let _ = self.run_git(&["merge", "--abort"]).await;
-                    return Err(WorkspaceError::MergeConflict {
-                        task_id: task_id.to_string(),
-                        details: e.to_string(),
-                    });
-                }
-
-                let merge_commit = self.run_git(&["rev-parse", "HEAD"]).await.ok();
-
-                // Clean up mounts, worktree, and ephemeral branch
+            IsolationStrategy::TempDir => {
                 let unmounted_caches =
-                    EnvironmentManager::cleanup_mounts(&target_path).unwrap_or_default();
-                if target_path.exists() {
-                    let _ = self
-                        .run_git(&["worktree", "remove", "--force", &path_str])
-                        .await;
-                    if target_path.exists() {
-                        let _ = fs::remove_dir_all(&target_path).await;
+                    EnvironmentManager::cleanup_mounts(&ws_path).unwrap_or_default();
+
+                match action {
+                    TeardownAction::Retain => Ok(TeardownReceipt {
+                        task_id: task_id.to_string(),
+                        action_taken: "retained".to_string(),
+                        workspace_path: ws_path,
+                        branch_deleted: false,
+                        merge_commit: None,
+                        duration_ms: start_time.elapsed().as_millis() as u64,
+                        unmounted_caches: Vec::new(),
+                    }),
+                    TeardownAction::Abort | TeardownAction::Merge { .. } => {
+                        if ws_path.exists() {
+                            let _ = fs::remove_dir_all(&ws_path).await;
+                        }
+                        self.remove_metadata(task_id).await;
+                        Ok(TeardownReceipt {
+                            task_id: task_id.to_string(),
+                            action_taken: "aborted".to_string(),
+                            workspace_path: ws_path,
+                            branch_deleted: false,
+                            merge_commit: None,
+                            duration_ms: start_time.elapsed().as_millis() as u64,
+                            unmounted_caches,
+                        })
                     }
                 }
-                let branch_deleted = self.run_git(&["branch", "-D", &branch_name]).await.is_ok();
-
-                Ok(TeardownReceipt {
-                    task_id: task_id.to_string(),
-                    action_taken: "merged".to_string(),
-                    workspace_path: target_path,
-                    branch_deleted,
-                    merge_commit,
-                    duration_ms: start_time.elapsed().as_millis() as u64,
-                    unmounted_caches,
-                })
             }
-            TeardownAction::Retain => Ok(TeardownReceipt {
-                task_id: task_id.to_string(),
-                action_taken: "retained".to_string(),
-                workspace_path: target_path,
-                branch_deleted: false,
-                merge_commit: None,
-                duration_ms: start_time.elapsed().as_millis() as u64,
-                unmounted_caches: Vec::new(),
-            }),
+            IsolationStrategy::Worktree => {
+                let target_path = ws_path;
+                let branch_name = Self::branch_name_for_task(task_id);
+                let path_str = target_path.to_string_lossy().to_string();
+
+                match action {
+                    TeardownAction::Abort => {
+                        let unmounted_caches =
+                            EnvironmentManager::cleanup_mounts(&target_path).unwrap_or_default();
+                        if target_path.exists() {
+                            let _ = self
+                                .run_git(&["worktree", "remove", "--force", &path_str])
+                                .await;
+                            if target_path.exists() {
+                                let _ = fs::remove_dir_all(&target_path).await;
+                            }
+                        }
+                        let branch_deleted = if self.branch_exists(&branch_name).await {
+                            self.run_git(&["branch", "-D", &branch_name]).await.is_ok()
+                        } else {
+                            false
+                        };
+
+                        self.remove_metadata(task_id).await;
+
+                        Ok(TeardownReceipt {
+                            task_id: task_id.to_string(),
+                            action_taken: "aborted".to_string(),
+                            workspace_path: target_path,
+                            branch_deleted,
+                            merge_commit: None,
+                            duration_ms: start_time.elapsed().as_millis() as u64,
+                            unmounted_caches,
+                        })
+                    }
+                    TeardownAction::Merge {
+                        target_branch,
+                        squash,
+                    } => {
+                        if !self.branch_exists(&target_branch).await {
+                            return Err(WorkspaceError::BranchError(format!(
+                                "Target branch '{}' does not exist",
+                                target_branch
+                            )));
+                        }
+
+                        // Switch repo_root to target_branch
+                        self.run_git(&["checkout", &target_branch]).await?;
+
+                        let merge_res = if squash {
+                            let res = self.run_git(&["merge", "--squash", &branch_name]).await;
+                            if res.is_ok() {
+                                let commit_msg =
+                                    format!("feat({}): squash merge task {}", task_id, task_id);
+                                self.run_git(&["commit", "-m", &commit_msg]).await
+                            } else {
+                                res
+                            }
+                        } else {
+                            let commit_msg =
+                                format!("Merge branch '{}' into {}", branch_name, target_branch);
+                            self.run_git(&["merge", "--no-ff", "-m", &commit_msg, &branch_name])
+                                .await
+                        };
+
+                        if let Err(e) = merge_res {
+                            let _ = self.run_git(&["merge", "--abort"]).await;
+                            return Err(WorkspaceError::MergeConflict {
+                                task_id: task_id.to_string(),
+                                details: e.to_string(),
+                            });
+                        }
+
+                        let merge_commit = self.run_git(&["rev-parse", "HEAD"]).await.ok();
+
+                        // Clean up mounts, worktree, and ephemeral branch
+                        let unmounted_caches =
+                            EnvironmentManager::cleanup_mounts(&target_path).unwrap_or_default();
+                        if target_path.exists() {
+                            let _ = self
+                                .run_git(&["worktree", "remove", "--force", &path_str])
+                                .await;
+                            if target_path.exists() {
+                                let _ = fs::remove_dir_all(&target_path).await;
+                            }
+                        }
+                        let branch_deleted =
+                            self.run_git(&["branch", "-D", &branch_name]).await.is_ok();
+
+                        self.remove_metadata(task_id).await;
+
+                        Ok(TeardownReceipt {
+                            task_id: task_id.to_string(),
+                            action_taken: "merged".to_string(),
+                            workspace_path: target_path,
+                            branch_deleted,
+                            merge_commit,
+                            duration_ms: start_time.elapsed().as_millis() as u64,
+                            unmounted_caches,
+                        })
+                    }
+                    TeardownAction::Retain => Ok(TeardownReceipt {
+                        task_id: task_id.to_string(),
+                        action_taken: "retained".to_string(),
+                        workspace_path: target_path,
+                        branch_deleted: false,
+                        merge_commit: None,
+                        duration_ms: start_time.elapsed().as_millis() as u64,
+                        unmounted_caches: Vec::new(),
+                    }),
+                }
+            }
         }
     }
 
@@ -405,6 +617,10 @@ impl WorkspaceManager for WorktreeOrchestrator {
                 Some(name) => name.to_string(),
                 None => continue,
             };
+
+            if task_id.starts_with('.') {
+                continue;
+            }
 
             let is_stale = match entry.metadata().await {
                 Ok(metadata) => match metadata.modified() {
@@ -623,5 +839,93 @@ mod tests {
         let report = orchestrator.prune_stale(0).await.expect("prune");
         assert!(report.pruned_task_ids.contains(&"task-stale".to_string()));
         assert!(!handle.workspace_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_provision_and_teardown_inplace() {
+        let repo = setup_git_repo().await;
+        let orchestrator = WorktreeOrchestrator::new(repo.path());
+
+        let req = WorkspaceProvisionRequest::new("task-inplace-01", repo.path())
+            .with_strategy(IsolationStrategy::InPlace);
+
+        let handle = orchestrator
+            .provision(&req)
+            .await
+            .expect("provision inplace");
+        assert_eq!(handle.task_id, "task-inplace-01");
+        assert_eq!(handle.strategy, IsolationStrategy::InPlace);
+        assert_eq!(handle.workspace_path, repo.path());
+        assert!(!handle.is_isolated);
+        assert_eq!(handle.branch_name, "main");
+        // Must not create git worktree
+        assert!(!orchestrator.task_worktree_path("task-inplace-01").exists());
+
+        // Double provision must fail
+        let dup_err = orchestrator.provision(&req).await.unwrap_err();
+        assert!(matches!(dup_err, WorkspaceError::AlreadyExists { .. }));
+
+        // Teardown must be safe no-op and never delete repo_root or branch
+        let receipt = orchestrator
+            .teardown("task-inplace-01", TeardownAction::Abort)
+            .await
+            .expect("teardown inplace");
+
+        assert_eq!(receipt.task_id, "task-inplace-01");
+        assert_eq!(
+            receipt.action_taken,
+            "in-place workspace completed without deletion"
+        );
+        assert!(!receipt.branch_deleted);
+        assert_eq!(receipt.workspace_path, repo.path());
+        assert!(repo.path().exists());
+        assert!(repo.path().join("README.md").exists());
+        assert!(orchestrator.branch_exists("main").await);
+
+        // Teardown again should be NotFound
+        let not_found_err = orchestrator
+            .teardown("task-inplace-01", TeardownAction::Abort)
+            .await
+            .unwrap_err();
+        assert!(matches!(not_found_err, WorkspaceError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_provision_and_teardown_tempdir() {
+        let repo = setup_git_repo().await;
+        let orchestrator = WorktreeOrchestrator::new(repo.path());
+
+        let req = WorkspaceProvisionRequest::new("task-temp-01", repo.path())
+            .with_strategy(IsolationStrategy::TempDir);
+
+        let handle = orchestrator
+            .provision(&req)
+            .await
+            .expect("provision tempdir");
+        assert_eq!(handle.task_id, "task-temp-01");
+        assert_eq!(handle.strategy, IsolationStrategy::TempDir);
+        assert!(handle.is_isolated);
+        assert!(handle.workspace_path.exists());
+
+        let temp_file = handle.workspace_path.join("scratch.txt");
+        fs::write(&temp_file, "hello temp").await.unwrap();
+        assert!(temp_file.exists());
+
+        // Teardown must remove temp directory
+        let receipt = orchestrator
+            .teardown("task-temp-01", TeardownAction::Abort)
+            .await
+            .expect("teardown tempdir");
+
+        assert_eq!(receipt.task_id, "task-temp-01");
+        assert_eq!(receipt.action_taken, "aborted");
+        assert!(!handle.workspace_path.exists());
+
+        // Teardown again should be NotFound
+        let not_found_err = orchestrator
+            .teardown("task-temp-01", TeardownAction::Abort)
+            .await
+            .unwrap_err();
+        assert!(matches!(not_found_err, WorkspaceError::NotFound { .. }));
     }
 }

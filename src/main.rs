@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use k0maru_workspace::handle::{CacheType, TeardownAction, WorkspaceProvisionRequest};
+use k0maru_workspace::handle::{
+    CacheType, IsolationStrategy, TeardownAction, WorkspaceProvisionRequest,
+};
 use k0maru_workspace::orchestrator::{WorkspaceManager, WorktreeOrchestrator};
 use k0maru_workspace::router::{
     AgentType, MultiplexerType, RouterDispatchOptions, TaskEnvelope, WorkspaceRouterAdapter,
@@ -28,6 +30,8 @@ enum Commands {
         repo: PathBuf,
         #[arg(long)]
         base: Option<String>,
+        #[arg(long, value_enum, default_value_t = StrategyArg::Worktree)]
+        strategy: StrategyArg,
         #[arg(long, value_enum)]
         cache: Vec<CacheArg>,
         #[arg(long)]
@@ -46,6 +50,9 @@ enum Commands {
         /// Override base branch
         #[arg(long)]
         base: Option<String>,
+        /// Override isolation strategy (worktree, inplace, tempdir)
+        #[arg(long, value_enum)]
+        strategy: Option<StrategyArg>,
         /// Multiplexer backend (tmux, herdr, none)
         #[arg(long, value_enum, default_value_t = MultiplexerArg::None)]
         multiplexer: MultiplexerArg,
@@ -135,6 +142,26 @@ enum Commands {
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum StrategyArg {
+    #[value(name = "worktree")]
+    Worktree,
+    #[value(name = "inplace", alias = "in-place")]
+    InPlace,
+    #[value(name = "tempdir", alias = "temp-dir")]
+    TempDir,
+}
+
+impl From<StrategyArg> for IsolationStrategy {
+    fn from(arg: StrategyArg) -> Self {
+        match arg {
+            StrategyArg::Worktree => Self::Worktree,
+            StrategyArg::InPlace => Self::InPlace,
+            StrategyArg::TempDir => Self::TempDir,
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum ActionArg {
     Abort,
     Merge,
@@ -201,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
             task_id,
             repo,
             base,
+            strategy,
             cache,
             inject,
             json,
@@ -208,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
             let orchestrator = WorktreeOrchestrator::new(&repo);
             let shared_caches: Vec<CacheType> = cache.into_iter().map(Into::into).collect();
             let mut req = WorkspaceProvisionRequest::new(&task_id, &repo)
+                .with_strategy(strategy.into())
                 .with_caches(shared_caches)
                 .with_injected_configs(inject);
 
@@ -223,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
                         println!("Provisioned sandbox for task '{}':", handle.task_id);
                         println!("  Workspace Path: {}", handle.workspace_path.display());
                         println!("  Branch:         {}", handle.branch_name);
+                        println!("  Strategy:       {:?}", handle.strategy);
                         println!(
                             "  Base Branch:    {}",
                             handle.base_branch.as_deref().unwrap_or("HEAD")
@@ -245,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
             envelope,
             repo,
             base,
+            strategy,
             multiplexer,
             agent,
             cmd,
@@ -282,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
                 shared_caches,
                 injected_configs: inject,
                 execute_multiplexer: spawn,
+                isolate_strategy: strategy.map(Into::into),
             };
 
             match WorkspaceRouterAdapter::dispatch(&task_envelope, opts).await {

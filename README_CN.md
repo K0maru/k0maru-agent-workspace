@@ -246,6 +246,10 @@ async fn main() -> anyhow::Result<()> {
   - 契约严格对齐 `agent-receipt-v1.json` 不可变凭证。
   - 范围防腐门禁（Scope Guard），根据白名单物理拦截越权文件篡改。
   - Git Diff SHA-256 指纹验签与测试 Exit Code 驱动的原子合并/自动回滚。
+- [x] **Phase 5: 多模式隔离策略与只读直通 (Multi-Strategy Isolation)**
+  - `InPlace` 只读直通：针对只读探索与检索任务直接复用主仓 CWD，零分支零开销，Teardown 绝不误删主仓。
+  - `TempDir` 纯临时沙箱：针对非 Git 仓库或试运行任务创建瞬态独立目录，支持干净回收。
+  - `WorkspaceRouterAdapter` 智能策略推导：根据工单标签（`read_only` / `in_place` / `query`）自动自适应选择 `InPlace` 或 `Worktree`。
 
 ---
 
