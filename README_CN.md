@@ -67,16 +67,19 @@ cargo build --release
 # 生成的可执行文件位于 ./target/release/k0maru-workspace
 ```
 
-### 2. 创建隔离沙箱（支持缓存挂载与配置注入）
+### 2. 创建隔离沙箱（支持缓存挂载、配置注入与隔离策略）
 
+**Worktree 物理隔离（代码修改默认策略）：**
 ```bash
 k0maru-workspace provision \
   --task-id task_01 \
   --repo /path/to/repo \
   --base dev \
+  --strategy worktree \
   --cache cargo \
   --cache node \
-  --inject .env
+  --inject .env \
+  --inject .mcp.json
 ```
 输出示例：
 ```text
@@ -84,8 +87,20 @@ Provisioned sandbox for task 'task_01':
   Workspace Path: /path/to/repo/.worktrees/task_01
   Branch:         feat/task-01
   Base Branch:    dev
+  Strategy:       Worktree
   Mounted Caches: [CargoTarget, NodeModules]
-  Injected Files: [".env"]
+  Injected Files: [".env", ".mcp.json"]
+```
+
+**原地只读直通（用于纯代码检索、只读查询与架构检查）：**
+```bash
+# 直接复用当前主仓 CWD：零 Worktree 创建开销，Teardown 为安全空操作（绝对不碰 repo_root）
+k0maru-workspace provision --task-id query_01 --repo /path/to/repo --strategy inplace
+```
+
+**临时目录隔离（用于非 Git 仓库或瞬态试运行脚本）：**
+```bash
+k0maru-workspace provision --task-id scratch_01 --repo /path/to/repo --strategy tempdir
 ```
 
 ### 3. 查看活跃沙箱列表
@@ -94,20 +109,40 @@ Provisioned sandbox for task 'task_01':
 k0maru-workspace list --repo /path/to/repo
 ```
 
-### 4. 回收与清理沙箱
+### 4. 销毁或合并沙箱 (Teardown 生命周期回收)
 
-**放弃改动并强力清理：**
-### 4. 销毁或合并沙箱 (Teardown)
+`k0maru-workspace teardown` 提供三种标准回收动作：
 
-**放弃修改并原子清理：**
+**动作 1：Abort（安全撤销与丢弃改动）**
+丢弃工作区所有改动，安全解绑共享缓存，彻底删除 Worktree 目录，并强力删除临时特性分支（`branch -D`）：
 ```bash
 k0maru-workspace teardown --task-id task_01 --repo /path/to/repo --action abort
 ```
 
-**测试通过并合并至目标分支：**
-*(注：合入前的物理退出码测试与门禁校验由 `k0maru-verifier` 独立裁决)*
+**动作 2：Merge（经密码学验签的安全合并）**
+物理强制执行 **No-Receipt-No-Merge（无收据不合并）** 门禁铁律。必须存在合法有效的执行收据（`agent-receipt-v1.json`），且核验 `verdict == "success"` 且 Git Diff Patch SHA-256 摘要逐字节完全匹配：
 ```bash
-k0maru-workspace teardown --task-id task_01 --repo /path/to/repo --action merge --target-branch dev --squash
+# 标准合入（Squash 合并至 dev 集成主干）：
+k0maru-workspace teardown \
+  --task-id task_01 \
+  --repo /path/to/repo \
+  --action merge \
+  --target-branch dev \
+  --squash
+
+# 极端场景人工紧急旁路（跳过收据与哈希校验）：
+k0maru-workspace teardown \
+  --task-id task_01 \
+  --repo /path/to/repo \
+  --action merge \
+  --target-branch dev \
+  --force
+```
+
+**动作 3：Retain（现场保留用于事后取证调试）**
+安全解除缓存挂载并注销元数据，但完整保留磁盘上的 Worktree 目录与分支供人工现场排错：
+```bash
+k0maru-workspace teardown --task-id task_01 --repo /path/to/repo --action retain
 ```
 
 ### 5. 联动 Router 工单与多路复用器分屏
@@ -132,18 +167,60 @@ k0maru-workspace prune --repo /path/to/repo --max-age-secs 86400
 
 ---
 
+## 🔒 架构级硬门禁：无收据不合并 (No-Receipt-No-Merge) 与 SHA-256 防篡改
+
+为彻底杜绝未经物理测试检验、断言失败或中途遭恶意篡改的代码污染集成主干（`dev`、`main`），`k0maru-agent-workspace` 在合并层确立并物理固化了 **No-Receipt-No-Merge** 架构不变量：
+
+```mermaid
+flowchart TD
+    TeardownCmd["k0maru-workspace teardown --action merge"] --> ForceCheck{"是否携带 --force 标志?"}
+    ForceCheck -- "是 (人工紧急旁路)" --> ExecuteMerge["执行 Fast-Forward / Squash 合并并回收 Worktree"]
+    ForceCheck -- "否 (默认物理强校验)" --> LocateReceipt["检索执行收据 (agent-receipt-v1.json)<br/>1. $K0MARU_RECEIPT_DIR/<task_id>.json<br/>2. ~/.k0maru/receipts/<task_id>.json<br/>3. <repo_root>/.worktrees/.receipts/<task_id>.json<br/>4. <repo_root>/.receipts/<task_id>.json"]
+
+    LocateReceipt --> ReceiptFound{"收据是否存在且有效?"}
+    ReceiptFound -- "缺失或损坏" --> Reject["阻断合并！<br/>退出码 1<br/>WorkspaceError::VerificationReceiptRequired"]
+    ReceiptFound -- "解析成功" --> CheckVerdict{"receipt.verdict == 'success'?"}
+
+    CheckVerdict -- "失败 (failed / error)" --> Reject
+    CheckVerdict -- "成功 (success)" --> CheckHash{"当前真实 Git Diff SHA-256 == receipt.artifacts.git_patch_sha256?"}
+
+    CheckHash -- "不一致 (代码被篡改 / 漂移)" --> Reject
+    CheckHash -- "完全匹配 (验签通过)" --> ExecuteMerge
+```
+
+### 1. No-Receipt-No-Merge 物理硬约束
+- 在自主多智能体协作网络中，“信赖调用者会自觉跑测试”是极其脆弱的。系统在 Git 执行物理合并的前一刻执行硬件级拦截。
+- 若收据缺失、损坏、或 `verdict != "success"`，`teardown --action merge` 立即强行终止，抛出强类型错误 `WorkspaceError::VerificationReceiptRequired` 并在 CLI 退出码返回 `1`。
+
+### 2. Git Diff Patch 密码学验签 (SHA-256)
+- 仅检验一次测试通过是不充分的：Agent 在通过测试裁判后，完全可能因幻觉或逻辑分支在合入前再次擅自篡改文件。
+- `WorktreeOrchestrator` 现场计算沙箱当前针对目标分支（或 `HEAD` 回退）的真实 Git Diff SHA-256 十六进制摘要，与收据中的 `git_patch_sha256` 逐字节比对。任何未经裁判复核的代码漂移都将被毫秒级拦截。
+
+### 3. 收据检索优先级
+由独立裁判工具 [`k0maru-agent-verifier`](https://github.com/K0maru/k0maru-agent-verifier) 签署的收据将按以下优先级自动发现：
+1. 环境变量显式指定路径：`$K0MARU_RECEIPT_DIR/<task_id>.json`
+2. 用户主目录收据仓：`~/.k0maru/receipts/<task_id>.json`
+3. Worktree 内部收据目录：`<repo_root>/.worktrees/.receipts/<task_id>.json`
+4. 仓库级收据目录：`<repo_root>/.receipts/<task_id>.json`
+5. 根目录下邻近收据：`<repo_root>/<task_id>.receipt.json` 或 `<repo_root>/<task_id>.json`
+
+### 4. 应急逃生通道
+在架构师人工介入或灾难恢复场景下，可显式追加 `--force` 参数以跳过收据与哈希强制检查。
+
+---
+
 ## ⚖️ 质量门禁与测试裁判解耦规约
 
 遵循 Unix 哲学与 **K0maru-Harness** 矩阵正交解耦规范：
-- `k0maru-agent-workspace` 严格聚焦于**工作区与沙箱的瞬态生命周期管理**（`provision`、`teardown`、`list`、`prune`、`route`）。
+- `k0maru-agent-workspace` 严格聚焦于**工作区沙箱瞬态生命周期管理**（`provision`、`teardown`、`list`、`prune`、`route`）与**合并物理守卫**。
 - 客观进程退出码裁判、范围防腐（Scope Guard）与 `agent-receipt-v1.json` 不可变凭证签发，由第四块独立核心积木 [`k0maru-agent-verifier`](https://github.com/K0maru/k0maru-agent-verifier) 负责。
 - 标准协同流转时序：
   ```mermaid
   flowchart LR
-      Router["k0maru-router"] --> Provision["workspace provision / route"]
-      Provision --> Agent["Agent 沙箱编码修改"]
-      Agent --> Verifier["k0maru-verifier (Exit Code 物理硬门禁)"]
-      Verifier --> Merge["workspace teardown --action merge"]
+      Router["k0maru-router<br/>(任务工单派发)"] --> Provision["workspace provision<br/>(配发隔离沙箱)"]
+      Provision --> Agent["Agent 隔离编码<br/>(干净 CWD)"]
+      Agent --> Verifier["k0maru-verifier<br/>(Exit Code 硬裁判与签署收据)"]
+      Verifier --> Merge["workspace teardown --action merge<br/>(核验收据与 SHA-256 合并)"]
   ```
 
 ---
@@ -215,6 +292,12 @@ async fn main() -> anyhow::Result<()> {
   - `InPlace` 只读直通：针对只读探索与检索任务直接复用主仓 CWD，零分支零开销，Teardown 绝不误删主仓。
   - `TempDir` 纯临时沙箱：针对非 Git 仓库或试运行任务创建瞬态独立目录，支持干净回收。
   - `WorkspaceRouterAdapter` 智能策略推导：根据工单标签（`read_only` / `in_place` / `query`）自动自适应选择 `InPlace` 或 `Worktree`。
+- [x] **Phase 6: 物理级无收据不合并门禁 (No-Receipt-No-Merge) 与 SHA-256 防篡改**
+  - 架构级物理阻断：`teardown --action merge` 严苛拦截无有效通过收据（`agent-receipt-v1.json`）的合并操作。
+  - Git Diff Patch 密码学验签：比对沙箱当前真实 diff 与收据的 SHA-256 哈希，彻底阻断越权或裁判后代码篡改。
+  - 收据多源阶梯检索：支持 `$K0MARU_RECEIPT_DIR`、`~/.k0maru/receipts` 与 `.worktrees/.receipts`。
+  - 人工应急逃生通道：支持 `--force` 绕过标志。
+
 
 ---
 

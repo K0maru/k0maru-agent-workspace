@@ -67,16 +67,19 @@ cargo build --release
 # Binary will be available at ./target/release/k0maru-workspace
 ```
 
-### 2. Provision an Isolated Sandbox (with Caches & Configs)
+### 2. Provision an Isolated Sandbox (with Caches, Configs & Strategies)
 
+**Worktree isolation (default for code changes):**
 ```bash
 k0maru-workspace provision \
   --task-id task_01 \
   --repo /path/to/repo \
   --base dev \
+  --strategy worktree \
   --cache cargo \
   --cache node \
-  --inject .env
+  --inject .env \
+  --inject .mcp.json
 ```
 Output:
 ```text
@@ -84,8 +87,20 @@ Provisioned sandbox for task 'task_01':
   Workspace Path: /path/to/repo/.worktrees/task_01
   Branch:         feat/task-01
   Base Branch:    dev
+  Strategy:       Worktree
   Mounted Caches: [CargoTarget, NodeModules]
-  Injected Files: [".env"]
+  Injected Files: [".env", ".mcp.json"]
+```
+
+**In-place passthrough (for read-only queries or architecture checks):**
+```bash
+# Direct CWD passthrough: zero worktree overhead, safe no-op teardown (never touches repo_root)
+k0maru-workspace provision --task-id query_01 --repo /path/to/repo --strategy inplace
+```
+
+**Temporary directory isolation (for non-git or ephemeral scratch scripts):**
+```bash
+k0maru-workspace provision --task-id scratch_01 --repo /path/to/repo --strategy tempdir
 ```
 
 ### 3. List Active Sandboxes
@@ -94,17 +109,40 @@ Provisioned sandbox for task 'task_01':
 k0maru-workspace list --repo /path/to/repo
 ```
 
-### 4. Teardown a Sandbox
+### 4. Teardown a Sandbox (Lifecycle Termination)
 
-**Abort and clean up:**
+`k0maru-workspace teardown` supports three distinct termination actions:
+
+**Action 1: Abort (Rollback and Clean Up)**
+Discards all uncommitted changes, safely unlinks shared caches, removes the worktree, and deletes the ephemeral feature branch (`branch -D`):
 ```bash
 k0maru-workspace teardown --task-id task_01 --repo /path/to/repo --action abort
 ```
 
-**Merge changes to main/dev:**
-*(Note: Pre-merge quality verification and test oracle execution are delegated to `k0maru-verifier`)*
+**Action 2: Merge (Cryptographically Verified Integration)**
+Enforces the **No-Receipt-No-Merge Invariant**. Requires a valid execution receipt (`agent-receipt-v1.json`) with `verdict == "success"` and matching git diff patch SHA-256:
 ```bash
-k0maru-workspace teardown --task-id task_01 --repo /path/to/repo --action merge --target-branch dev --squash
+# Standard verified merge (squash merge into dev branch):
+k0maru-workspace teardown \
+  --task-id task_01 \
+  --repo /path/to/repo \
+  --action merge \
+  --target-branch dev \
+  --squash
+
+# Emergency manual bypass (skips receipt & hash verification):
+k0maru-workspace teardown \
+  --task-id task_01 \
+  --repo /path/to/repo \
+  --action merge \
+  --target-branch dev \
+  --force
+```
+
+**Action 3: Retain (Preserve for Post-Mortem & Forensic Debugging)**
+Unlinks shared caches and injects metadata but preserves the worktree directory and branch on disk:
+```bash
+k0maru-workspace teardown --task-id task_01 --repo /path/to/repo --action retain
 ```
 
 ### 5. Route TaskEnvelope from Router & Bind Multiplexer
@@ -125,22 +163,64 @@ k0maru-workspace route \
 k0maru-workspace prune --repo /path/to/repo --max-age-secs 86400
 ```
 
-> **Tip**: All commands support `--json` for automation and agent tool integration.
+> **Tip**: All commands support `--json` for automated agent pipelines and toolchain integrations.
+
+---
+
+## 🔒 Hard Architectural Gate: No-Receipt-No-Merge & SHA-256 Integrity
+
+To prevent unverified, broken, or tampered code from contaminating release trunks (`dev`, `main`), `k0maru-agent-workspace` enforces the **No-Receipt-No-Merge** physical architectural invariant:
+
+```mermaid
+flowchart TD
+    TeardownCmd["k0maru-workspace teardown --action merge"] --> ForceCheck{"Is --force flag set?"}
+    ForceCheck -- "Yes (Emergency Bypass)" --> ExecuteMerge["Execute Fast-Forward / Squash Merge & Clean Worktree"]
+    ForceCheck -- "No (Default Strict Verification)" --> LocateReceipt["Locate Execution Receipt (agent-receipt-v1.json)<br/>1. $K0MARU_RECEIPT_DIR/<task_id>.json<br/>2. ~/.k0maru/receipts/<task_id>.json<br/>3. <repo_root>/.worktrees/.receipts/<task_id>.json<br/>4. <repo_root>/.receipts/<task_id>.json"]
+
+    LocateReceipt --> ReceiptFound{"Receipt found & valid JSON?"}
+    ReceiptFound -- "Missing / Corrupt" --> Reject["ABORT MERGE<br/>Exit Code 1<br/>WorkspaceError::VerificationReceiptRequired"]
+    ReceiptFound -- "Valid JSON" --> CheckVerdict{"receipt.verdict == 'success'?"}
+
+    CheckVerdict -- "Failed / Error" --> Reject
+    CheckVerdict -- "Success" --> CheckHash{"Actual Git Diff SHA-256 == receipt.artifacts.git_patch_sha256?"}
+
+    CheckHash -- "Mismatch (Tampered / Drifted)" --> Reject
+    CheckHash -- "Verified Match" --> ExecuteMerge
+```
+
+### 1. No-Receipt-No-Merge Invariant
+- Merging without a passing receipt is physically blocked at runtime. Relying on "good intentions" or procedural checklists is insufficient for autonomous multi-agent swarms.
+- If a receipt is missing, corrupt, or reports `verdict != "success"`, `teardown --action merge` aborts immediately with typed error `WorkspaceError::VerificationReceiptRequired` and non-zero exit code `1`.
+
+### 2. Cryptographic Patch Integrity (SHA-256)
+- Passing a test suite once is not enough: an agent might inadvertently (or maliciously) mutate code *after* verification has completed but *before* teardown merge.
+- `WorktreeOrchestrator` computes the exact SHA-256 hex digest of the worktree's diff against the target branch (or `HEAD` fallback). If this digest does not byte-for-byte match `receipt.artifacts.git_patch_sha256`, the merge is blocked immediately to prevent post-verification code drift.
+
+### 3. Receipt Discovery Hierarchy
+Receipts generated by [`k0maru-agent-verifier`](https://github.com/K0maru/k0maru-agent-verifier) are automatically discovered using the following priority:
+1. Directory specified by `$K0MARU_RECEIPT_DIR/<task_id>.json`
+2. Standard home directory receipt store: `~/.k0maru/receipts/<task_id>.json`
+3. Worktree-local receipts folder: `<repo_root>/.worktrees/.receipts/<task_id>.json`
+4. Repository-level receipts folder: `<repo_root>/.receipts/<task_id>.json`
+5. Worktree-adjacent receipt: `<repo_root>/<task_id>.receipt.json` or `<repo_root>/<task_id>.json`
+
+### 4. Emergency Bypass
+In human-in-the-loop disaster recovery scenarios, human architects can pass `--force` to bypass receipt and hash verification.
 
 ---
 
 ## ⚖️ Quality Gate & Verification Delegation
 
 In adherence to the Unix philosophy and the modular **K0maru-Harness** architecture:
-- `k0maru-agent-workspace` focuses strictly on **sandbox lifecycle management** (`provision`, `teardown`, `list`, `prune`, `route`).
+- `k0maru-agent-workspace` focuses strictly on **sandbox lifecycle management** (`provision`, `teardown`, `list`, `prune`, `route`) and **merge gatekeeping**.
 - Deterministic physical test oracle execution, scope guard checking, and `agent-receipt-v1.json` immutable receipt signing are delegated to the standalone [`k0maru-agent-verifier`](https://github.com/K0maru/k0maru-agent-verifier) CLI.
-- Standard flow:
+- Standard collaboration loop:
   ```mermaid
   flowchart LR
-      Router["k0maru-router"] --> Provision["workspace provision / route"]
-      Provision --> Agent["Agent Implements in Sandbox"]
-      Agent --> Verifier["k0maru-verifier (Exit Code & Scope Guard)"]
-      Verifier --> Merge["workspace teardown --action merge"]
+      Router["k0maru-router<br/>(Task Dispatch)"] --> Provision["workspace provision<br/>(Isolated Worktree)"]
+      Provision --> Agent["Agent Implements<br/>(Clean CWD)"]
+      Agent --> Verifier["k0maru-verifier<br/>(Exit Code & Sign Receipt)"]
+      Verifier --> Merge["workspace teardown --action merge<br/>(Verify Receipt & SHA-256)"]
   ```
 
 ---
@@ -212,6 +292,12 @@ async fn main() -> anyhow::Result<()> {
   - `InPlace` zero-overhead direct passthrough for read-only exploration with safe no-op teardown.
   - `TempDir` ephemeral filesystem directory isolation for non-git scratch scripts.
   - Automated strategy deduction in `WorkspaceRouterAdapter` based on task envelope tags (`read_only`, `in_place`, `query`).
+- [x] **Phase 6: Physical No-Receipt-No-Merge Security Gate & SHA-256 Integrity**
+  - Hard physical runtime barrier: `teardown --action merge` strictly rejects merges without a valid, passing `agent-receipt-v1.json`.
+  - Cryptographic patch integrity verification matching git diff SHA-256 against receipt hash to prevent post-verification drift.
+  - Priority discovery hierarchy supporting `$K0MARU_RECEIPT_DIR`, `~/.k0maru/receipts`, and `.worktrees/.receipts`.
+  - Emergency manual bypass with `--force` flag.
+
 
 ---
 
