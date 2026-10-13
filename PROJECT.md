@@ -49,4 +49,12 @@
 - [x] 4. 应急逃生与类型化错误：新增 `--force` 绕过标志用于人工紧急合并，默认拒绝时抛出 `WorkspaceError::VerificationReceiptRequired` 并在 CLI 返回退出码 1；
 - [x] 5. 编写 Phase 6 缺失收据拦截、失败收据拦截、篡改摘要拦截、有效收据放行、`--force` 绕过等完整集成测试套件。
 
+## 🧭 研发任务清单 (Phase 7 - Linda Tuple Space Async Bus & Lifecycle Settle)
+- [x] 1. 落地 Linda Tuple Space 空间原语引擎：实现 POSIX 原子落盘、`out`, `in`, `rd`, `list` 等标准共享内存操作；
+- [x] 2. 实现 `workspace tuple-claim --domain <DOM>`：原子消费 `TASK_READY` 元组，配发物理 Worktree 沙箱，并回写 `SANDBOX_READY`；
+- [x] 3. 实现 `workspace tuple-settle --task-id <ID>`：原子核验 `TASK_VERIFIED`、执行物理 No-Receipt-No-Merge 合并与回收，并回写 `TASK_COMPLETED`；
+- [x] 4. 确立 `TASK_BLOCKED` 故障安全熔断（Fail-Safe Abort）：自动安全回滚沙箱，保持主仓绝对零脏写污染；
+- [x] 5. 编写 Phase 7 完整端到端集成测试套件与 CLI 驱动验证。
+
+
 

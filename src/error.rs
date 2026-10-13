@@ -28,6 +28,9 @@ pub enum WorkspaceError {
 
     #[error("Verification receipt required for merge: {reason}")]
     VerificationReceiptRequired { reason: String },
+
+    #[error("Tuple space error: {0}")]
+    TupleSpaceError(String),
 }
 
 #[cfg(test)]
@@ -60,6 +63,9 @@ mod tests {
             err4.to_string(),
             "Verification receipt required for merge: receipt missing"
         );
+
+        let err5 = WorkspaceError::TupleSpaceError("failed to claim tuple".into());
+        assert_eq!(err5.to_string(), "Tuple space error: failed to claim tuple");
     }
 
     #[test]

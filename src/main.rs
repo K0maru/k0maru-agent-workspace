@@ -109,6 +109,62 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Claim a TASK_READY tuple from Linda Tuple Space, provision a sandbox, and emit SANDBOX_READY
+    #[command(name = "tuple-claim", alias = "tuple_claim")]
+    TupleClaim {
+        /// Target domain identifier (e.g. WORKSPACE, AUTH-SRV)
+        #[arg(long)]
+        domain: String,
+        /// Optional specific task ID to claim
+        #[arg(long)]
+        task_id: Option<String>,
+        /// Target repository root
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Base branch to branch off
+        #[arg(long)]
+        base: Option<String>,
+        /// Isolation strategy (worktree, inplace, tempdir)
+        #[arg(long, value_enum, default_value_t = StrategyArg::Worktree)]
+        strategy: StrategyArg,
+        /// Shared caches to mount
+        #[arg(long, value_enum)]
+        cache: Vec<CacheArg>,
+        /// Injected configuration files
+        #[arg(long)]
+        inject: Vec<String>,
+        /// Override tuple space directory (defaults to $K0MARU_TUPLE_DIR or ~/.k0maru/tuples)
+        #[arg(long)]
+        tuple_dir: Option<PathBuf>,
+        /// Output machine-readable JSON receipt
+        #[arg(long)]
+        json: bool,
+    },
+    /// Settle a task sandbox: abort if TASK_BLOCKED, or verify receipt, merge to target branch, teardown, and emit TASK_COMPLETED
+    #[command(name = "tuple-settle", alias = "tuple_settle")]
+    TupleSettle {
+        /// Associated task identifier to settle
+        #[arg(long)]
+        task_id: String,
+        /// Target repository root
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Target branch to merge into
+        #[arg(long, default_value = "dev")]
+        target_branch: String,
+        /// Squash merge into single commit
+        #[arg(long)]
+        squash: bool,
+        /// Force emergency bypass (skips receipt & hash verification)
+        #[arg(long)]
+        force: bool,
+        /// Override tuple space directory (defaults to $K0MARU_TUPLE_DIR or ~/.k0maru/tuples)
+        #[arg(long)]
+        tuple_dir: Option<PathBuf>,
+        /// Output machine-readable JSON receipt
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -422,6 +478,106 @@ async fn main() -> anyhow::Result<()> {
                 Err(err) => {
                     eprintln!("Error pruning workspaces: {}", err);
                     std::process::exit(1);
+                }
+            }
+        }
+        Commands::TupleClaim {
+            domain,
+            task_id,
+            repo,
+            base,
+            strategy,
+            cache,
+            inject,
+            tuple_dir,
+            json,
+        } => {
+            let opts = k0maru_workspace::tuple::TupleClaimOptions {
+                domain,
+                task_id,
+                repo_root: repo,
+                base_branch: base,
+                strategy: strategy.into(),
+                caches: cache.into_iter().map(Into::into).collect(),
+                injected_configs: inject,
+                tuple_dir,
+            };
+            match k0maru_workspace::tuple::tuple_claim(opts).await {
+                Ok(receipt) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&receipt)?);
+                    } else {
+                        println!(
+                            "Successfully claimed task '{}' from domain '{}':",
+                            receipt.sandbox.task_id, receipt.claimed_tuple.domain
+                        );
+                        println!(
+                            "  Workspace Path: {}",
+                            receipt.sandbox.workspace_path.display()
+                        );
+                        println!("  Branch:         {}", receipt.sandbox.branch_name);
+                        println!("  Strategy:       {:?}", receipt.sandbox.strategy);
+                        println!("  Claimed Tuple:  {}", receipt.claimed_tuple.id);
+                        println!("  Emitted Tuple:  {}", receipt.emitted_tuple.id);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Error claiming tuple task: {}", err);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::TupleSettle {
+            task_id,
+            repo,
+            target_branch,
+            squash,
+            force,
+            tuple_dir,
+            json,
+        } => {
+            let opts = k0maru_workspace::tuple::TupleSettleOptions {
+                task_id,
+                repo_root: repo,
+                target_branch,
+                squash,
+                force,
+                tuple_dir,
+            };
+            match k0maru_workspace::tuple::tuple_settle(opts).await {
+                Ok(receipt) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&receipt)?);
+                    } else {
+                        println!(
+                            "Settled task '{}' (action: {}):",
+                            receipt.task_id, receipt.action
+                        );
+                        if let Some(target) = &receipt.target_branch {
+                            println!("  Merged To:      {}", target);
+                        }
+                        if let Some(commit) = &receipt.teardown_receipt.merge_commit {
+                            println!("  Merge Commit:   {}", commit);
+                        }
+                        println!(
+                            "  Emitted Tuple:  {} (kind: {})",
+                            receipt.emitted_tuple.id, receipt.emitted_tuple.kind
+                        );
+                        println!(
+                            "  Duration:       {}ms",
+                            receipt.teardown_receipt.duration_ms
+                        );
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Error settling tuple task: {}", err);
+                    let exit_code = match err {
+                        k0maru_workspace::error::WorkspaceError::VerificationReceiptRequired {
+                            ..
+                        } => k0maru_workspace::receipt::EXIT_CODE_VERIFICATION_FAILED,
+                        _ => 1,
+                    };
+                    std::process::exit(exit_code);
                 }
             }
         }
